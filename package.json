@@ -1,0 +1,12 @@
+{
+  "name": "buywire",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/index.js",
+    "test": "node --test src/*.test.js"
+  }
+}
