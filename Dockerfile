@@ -12,7 +12,7 @@ ENV DATABASE_PATH=/app/data/buywire.sqlite
 ENV LOG_PATH=/app/data/buywire.log
 
 RUN mkdir -p /app/data
-VOLUME ["/app/data"]
+
 
 EXPOSE 8787
 
