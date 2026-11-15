@@ -70,6 +70,16 @@ export function openDatabase(filePath) {
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(SCHEMA);
+  for (const [name, type] of [
+    ["media_type", "TEXT"],
+    ["media_file_id", "TEXT"],
+    ["announced", "INTEGER NOT NULL DEFAULT 0"],
+  ]) {
+    const cols = db.prepare("PRAGMA table_info(competitions)").all();
+    if (!cols.some((col) => col.name === name)) {
+      db.exec(`ALTER TABLE competitions ADD COLUMN ${name} ${type}`);
+    }
+  }
 
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
   const setSettingStmt = db.prepare(
@@ -146,8 +156,9 @@ export function openDatabase(filePath) {
     },
     activeCompetition() {
       return (
-        db.prepare("SELECT * FROM competitions WHERE status = 'active' ORDER BY id DESC LIMIT 1").get() ||
-        null
+        db.prepare(
+          "SELECT * FROM competitions WHERE status IN ('active', 'holding') ORDER BY id DESC LIMIT 1",
+        ).get() || null
       );
     },
     competition(id) {
@@ -161,8 +172,8 @@ export function openDatabase(filePath) {
     createCompetition(row) {
       const result = db
         .prepare(
-          `INSERT INTO competitions(threshold_ui, threshold_raw, decimals, duration_days, prize_text, started_at, ends_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+          `INSERT INTO competitions(threshold_ui, threshold_raw, decimals, duration_days, prize_text, started_at, ends_at, status, media_type, media_file_id, announced)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0)`,
         )
         .run(
           row.thresholdUi,
@@ -172,6 +183,8 @@ export function openDatabase(filePath) {
           row.prizeText,
           row.startedAt,
           row.endsAt,
+          row.mediaType || null,
+          row.mediaFileId || null,
         );
       return Number(result.lastInsertRowid);
     },
@@ -183,6 +196,9 @@ export function openDatabase(filePath) {
     },
     markSummarySent(id) {
       db.prepare("UPDATE competitions SET summary_sent = 1, status = 'completed' WHERE id = ?").run(id);
+    },
+    markAnnounced(id) {
+      db.prepare("UPDATE competitions SET announced = 1 WHERE id = ?").run(id);
     },
     dueCompetitions(nowMs) {
       return db

@@ -8,15 +8,16 @@
  */
 
 /**
- * @param {{ status?: string, balanceRaw: bigint, thresholdRaw: bigint, buyRaw: bigint }} input
+ * @param {{ status?: string, balanceRaw: bigint, thresholdRaw: bigint, buyRaw: bigint, entriesOpen?: boolean }} input
  * @returns {"watching" | "eligible" | "disqualified"}
  */
-export function decideEntry({ status, balanceRaw, thresholdRaw, buyRaw }) {
+export function decideEntry({ status, balanceRaw, thresholdRaw, buyRaw, entriesOpen = true }) {
   const current = status || "watching";
   if (current === "disqualified") return "disqualified";
   if (current === "eligible") {
     return balanceRaw < thresholdRaw ? "disqualified" : "eligible";
   }
+  if (!entriesOpen) return "watching";
   if (buyRaw > 0n && balanceRaw >= thresholdRaw) return "eligible";
   return "watching";
 }

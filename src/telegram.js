@@ -176,11 +176,13 @@ export function createTelegram(ctx) {
       `Prize: ${escapeHtml(comp.prize_text)}`,
       `Entry: ${escapeHtml(formatUiString(comp.threshold_ui))} ${escapeHtml(ctx.engine.symbol())}`,
       `Hold: ${comp.duration_days} day(s)`,
-      `Time left: ${left}`,
+      comp.status === "holding" ? "Entries: closed. Hold is still being watched." : `Time left: ${left}`,
       `Eligible: ${eligible}`,
       `Disqualified: ${dq}`,
       "",
-      "A wallet enters when a buy leaves it at or above the entry amount. If the balance later drops under that line, it is out for good.",
+      "A wallet enters when a buy leaves it at or above the entry amount. Selling or transferring under that line disqualifies it for good.",
+      "",
+      "/stopcomp closes entries. /endcomp draws the winner list. /cancelcomp aborts.",
     ].join("\n");
   }
 
@@ -192,17 +194,24 @@ export function createTelegram(ctx) {
         [{ text: "Back", callback_data: "m:home" }],
       ]);
     }
+    const holding = ctx.db.activeCompetition()?.status === "holding";
     return keyboard([
       [
         { text: "Eligible", callback_data: "c:elig" },
         { text: "Disqualified", callback_data: "c:dq" },
       ],
-      [
-        { text: "End now", callback_data: "c:end" },
-        { text: "Cancel", callback_data: "c:cancel" },
-      ],
+      holding
+        ? [
+            { text: "Draw winners", callback_data: "c:end" },
+            { text: "Abort", callback_data: "c:cancel" },
+          ]
+        : [
+            { text: "Close entries", callback_data: "c:stop" },
+            { text: "Draw winners", callback_data: "c:end" },
+          ],
+      holding ? [] : [{ text: "Abort", callback_data: "c:cancel" }],
       [{ text: "Back", callback_data: "m:home" }],
-    ]);
+    ].filter((row) => row.length));
   }
 
   function statusText() {
@@ -236,6 +245,10 @@ export function createTelegram(ctx) {
       "/start — this panel",
       "/settings — minimum, emoji, media, mint",
       "/comp — buy competition",
+      "/buycomplb — entries and time left, including in the group",
+      "/stopcomp — close entries, keep watching holders",
+      "/endcomp — winner list with full addresses",
+      "/cancelcomp — abort the competition",
       "/status — stream health",
       "/help — this note",
       "/setchat — use inside the alert group",
@@ -257,6 +270,41 @@ export function createTelegram(ctx) {
       });
     }
     return sendText(chatId, text);
+  }
+
+  async function sendCard(chatId, text, mediaType, fileId) {
+    const map = { photo: ["sendPhoto", "photo"], animation: ["sendAnimation", "animation"], video: ["sendVideo", "video"] };
+    const caption = text.length > 1024 ? `${text.slice(0, 1000)}…` : text;
+    if (mediaType && fileId && map[mediaType]) {
+      const [method, field] = map[mediaType];
+      return tg(method, {
+        chat_id: chatId,
+        [field]: fileId,
+        caption,
+        parse_mode: "HTML",
+      });
+    }
+    return sendText(chatId, text);
+  }
+
+  function confirmText(draft) {
+    const card = draft.mediaType ? draft.mediaType : "none";
+    return [
+      "<b>Start this competition?</b>",
+      `Entry: ${escapeHtml(formatUiString(draft.thresholdUi))} ${escapeHtml(ctx.engine.symbol())}`,
+      `Hold: ${draft.durationDays} day(s)`,
+      `Prize: ${escapeHtml(draft.prize)}`,
+      `Card: ${escapeHtml(card)}`,
+    ].join("\n");
+  }
+
+  function confirmKeyboard() {
+    return keyboard([
+      [
+        { text: "Start", callback_data: "x:yes" },
+        { text: "Cancel", callback_data: "x:no" },
+      ],
+    ]);
   }
 
   async function notifyAdmins(text) {
@@ -351,7 +399,15 @@ export function createTelegram(ctx) {
     if (data === "c:end") {
       try {
         await ctx.engine.endCompetitionNow();
-        return show(update, "Competition closed. The wallet list is in your DMs.", compKeyboard());
+        return show(update, "Winner list sent in this chat. Full addresses are in that message.", compKeyboard());
+      } catch (err) {
+        return show(update, escapeHtml(err.message), compKeyboard());
+      }
+    }
+    if (data === "c:stop") {
+      try {
+        ctx.engine.stopCompetition();
+        return show(update, "Entries are closed. Current wallets are still watched. Sell under the line and they are out. Send /endcomp when you want the winner list.", compKeyboard());
       } catch (err) {
         return show(update, escapeHtml(err.message), compKeyboard());
       }
@@ -359,7 +415,7 @@ export function createTelegram(ctx) {
     if (data === "c:cancel") {
       try {
         ctx.engine.cancelCompetition();
-        return show(update, "Competition cancelled. No winner list was sent.", compKeyboard());
+        return show(update, "Competition aborted. No winner list was sent.", compKeyboard());
       } catch (err) {
         return show(update, escapeHtml(err.message), compKeyboard());
       }
@@ -375,6 +431,13 @@ export function createTelegram(ctx) {
       ctx.db.setSession(fromId, "comp_prize", draft);
       return show(update, `Hold is ${days} day(s).\n\nSend the prize as text. Example: <code>$25 of SOL</code>. This is a label, not a payment.`, keyboard([[{ text: "Back", callback_data: "m:comp" }]]));
     }
+    if (data === "c:skipmedia") {
+      const draft = { ...(ctx.db.session(fromId).data || {}) };
+      delete draft.mediaType;
+      delete draft.mediaFileId;
+      ctx.db.setSession(fromId, "comp_confirm", draft);
+      return show(update, confirmText(draft), confirmKeyboard());
+    }
     if (data === "x:yes") {
       const draft = ctx.db.session(fromId).data || {};
       try {
@@ -382,11 +445,16 @@ export function createTelegram(ctx) {
           thresholdUi: draft.thresholdUi,
           durationDays: draft.durationDays,
           prize: draft.prize,
+          mediaType: draft.mediaType || "",
+          mediaFileId: draft.mediaFileId || "",
         });
         ctx.db.clearSession(fromId);
+        const posted = Boolean(comp.announced);
         return show(
           update,
-          `Competition #${comp.id} is live.\nPrize: ${escapeHtml(comp.prize_text)}\nEntry: ${escapeHtml(formatUiString(comp.threshold_ui))}`,
+          posted
+            ? `Competition #${comp.id} is live. The card is in the alert group.`
+            : `Competition #${comp.id} is live, but no alert group is set. Add the bot to the group and send /setchat there. The card will post then.`,
           compKeyboard(),
         );
       } catch (err) {
@@ -426,7 +494,46 @@ export function createTelegram(ctx) {
       }
       ctx.db.setSetting("alert_chat_id", String(chat.id));
       ctx.log.info("alert chat set", { chatId: chat.id });
-      await sendText(chat.id, `Buy alerts will post here.\n<code>${chat.id}</code>`);
+      const posted = await ctx.engine.announceActive();
+      await sendText(
+        chat.id,
+        posted
+          ? `Buy alerts will post here.\n<code>${chat.id}</code>\n\nThe buy comp card is in this chat.`
+          : `Buy alerts will post here.\n<code>${chat.id}</code>`,
+      );
+      return;
+    }
+
+    if (command === "/buycomplb") {
+      await sendText(chat.id, ctx.engine.leaderboardText());
+      return;
+    }
+
+    if (command === "/stopcomp" || command === "/endcomp" || command === "/cancelcomp") {
+      if (chat.type !== "private") {
+        await sendText(chat.id, "Send that in a private chat with me. The winner list is not posted here.");
+        return;
+      }
+      if (!isAdmin(fromId)) {
+        await sendText(chat.id, "Operators only. Send /start first.");
+        return;
+      }
+      try {
+        if (command === "/stopcomp") {
+          ctx.engine.stopCompetition();
+          await sendText(chat.id, "Entries are closed. Everyone already in is still watched. A sell under the entry size disqualifies them. Send /endcomp when you want the winner list.");
+          return;
+        }
+        if (command === "/cancelcomp") {
+          ctx.engine.cancelCompetition();
+          await sendText(chat.id, "Competition aborted. No winner list was sent.");
+          return;
+        }
+        await ctx.engine.endCompetitionNow();
+        await sendText(chat.id, "Winner list is above. Those are the full addresses still eligible.");
+      } catch (err) {
+        await sendText(chat.id, escapeHtml(err.message));
+      }
       return;
     }
 
@@ -458,6 +565,7 @@ export function createTelegram(ctx) {
     }
     if (command === "/settings") return sendText(chat.id, settingsText(), settingsKeyboard());
     if (command === "/comp") return sendText(chat.id, compText(), compKeyboard());
+    if (command === "/buycomplb") return sendText(chat.id, ctx.engine.leaderboardText());
     if (command === "/status") return sendText(chat.id, statusText(), keyboard([[{ text: "Menu", callback_data: "m:home" }]]));
 
     const session = ctx.db.session(fromId);
@@ -603,28 +711,22 @@ export function createTelegram(ctx) {
         return;
       }
       const draft = { ...(session.data || {}), prize: text };
-      ctx.db.setSession(fromId, "comp_confirm", draft);
+      ctx.db.setSession(fromId, "comp_media", draft);
       await sendText(
         chat.id,
-        [
-          "<b>Start this competition?</b>",
-          `Entry: ${escapeHtml(formatUiString(draft.thresholdUi))} ${escapeHtml(ctx.engine.symbol())}`,
-          `Hold: ${draft.durationDays} day(s)`,
-          `Prize: ${escapeHtml(draft.prize)}`,
-        ].join("\n"),
-        keyboard([
-          [
-            { text: "Start", callback_data: "x:yes" },
-            { text: "Cancel", callback_data: "x:no" },
-          ],
-        ]),
+        "Send a photo, GIF, or video. That file is the card posted in the group when the comp starts.",
+        keyboard([[{ text: "Skip media", callback_data: "c:skipmedia" }]]),
       );
+      return;
+    }
+    if (session.state === "comp_media") {
+      await sendText(chat.id, "Send a photo, GIF, or video, or tap Skip media.");
     }
   }
 
   async function handleMedia(message) {
     if (message.chat.type !== "private" || !isAdmin(message.from.id)) return;
-    if (ctx.db.session(message.from.id).state !== "media") return;
+    const session = ctx.db.session(message.from.id);
     let type = null;
     let fileId = null;
     if (message.photo?.length) {
@@ -638,6 +740,13 @@ export function createTelegram(ctx) {
       fileId = message.video.file_id;
     }
     if (!type || !fileId) return;
+    if (session.state === "comp_media") {
+      const draft = { ...(session.data || {}), mediaType: type, mediaFileId: fileId };
+      ctx.db.setSession(message.from.id, "comp_confirm", draft);
+      await sendText(message.chat.id, confirmText(draft), confirmKeyboard());
+      return;
+    }
+    if (session.state !== "media") return;
     ctx.db.setSetting("media_type", type);
     ctx.db.setSetting("media_file_id", fileId);
     ctx.db.clearSession(message.from.id);
@@ -691,6 +800,7 @@ export function createTelegram(ctx) {
 
   return {
     sendAlert,
+    sendCard,
     notifyAdmins,
     async start() {
       if (!token) {
@@ -707,12 +817,23 @@ export function createTelegram(ctx) {
             { command: "start", description: "Open the control panel" },
             { command: "settings", description: "Minimum, emoji, media, mint" },
             { command: "comp", description: "Buy competition" },
+            { command: "buycomplb", description: "Entries and time left" },
+            { command: "stopcomp", description: "Close entries, keep watching" },
+            { command: "endcomp", description: "Winner list with full addresses" },
+            { command: "cancelcomp", description: "Abort the competition" },
             { command: "status", description: "Stream health" },
             { command: "help", description: "How Buywire works" },
             { command: "setchat", description: "Post alerts in this chat" },
             { command: "cancel", description: "Stop the current prompt" },
           ],
         }).catch((err) => ctx.log.warn("setMyCommands failed", { err }));
+        await tg("setMyCommands", {
+          scope: { type: "all_group_chats" },
+          commands: [
+            { command: "buycomplb", description: "Entries and time left" },
+            { command: "setchat", description: "Post alerts in this chat" },
+          ],
+        }).catch((err) => ctx.log.warn("setMyCommands group scope failed", { err }));
       } catch (err) {
         ctx.status.telegram = "error";
         ctx.log.error("telegram getMe failed; will keep retrying polls", { err });

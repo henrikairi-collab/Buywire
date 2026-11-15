@@ -183,6 +183,7 @@ export function createEngine(ctx) {
       balanceRaw: bal.raw,
       thresholdRaw: BigInt(comp.threshold_raw),
       buyRaw: qualifies ? qualifyRaw : 0n,
+      entriesOpen: comp.status === "active",
     });
     if (next === "watching" && !existing) return { entered: false, disqualified: false };
     const total = BigInt(existing?.total_bought_raw || "0") + countRaw;
@@ -331,13 +332,10 @@ export function createEngine(ctx) {
       status.lastTxAt = parsed.timestamp ? parsed.timestamp * 1000 : Date.now();
       for (const note of notes) {
         if (note.entered) {
-          await notify(
-            `Competition entry\n<code>${escapeHtml(note.wallet)}</code>\nBalance is at or above the threshold after a buy.`,
-          );
+          const comp = ctx.db.activeCompetition();
+          if (comp) await announceEntry(note.wallet, comp, note.balanceRaw);
         } else if (note.disqualified) {
-          await notify(
-            `Disqualified\n<code>${escapeHtml(note.wallet)}</code>\nBalance dropped under the entry threshold.`,
-          );
+          await announceDisqualified(note.wallet);
         }
       }
     } catch (err) {
@@ -532,9 +530,7 @@ export function createEngine(ctx) {
         const note = await settleWallet(comp, row.wallet, { countRaw: 0n, qualifies: false, qualifyRaw: 0n });
         if (note.disqualified) {
           ctx.log.info("competition disqualified on refresh", { wallet: row.wallet });
-          await notify(
-            `Disqualified\n<code>${escapeHtml(row.wallet)}</code>\nBalance dropped under the entry threshold.`,
-          );
+          await announceDisqualified(row.wallet);
         }
       } catch (err) {
         ctx.log.error("competitor refresh failed", { wallet: row.wallet, err });
@@ -549,13 +545,9 @@ export function createEngine(ctx) {
       try {
         const { competitionId, wallet } = JSON.parse(job);
         const comp = ctx.db.competition(competitionId);
-        if (!comp || comp.status !== "active") continue;
+        if (!comp || (comp.status !== "active" && comp.status !== "holding")) continue;
         const note = await settleWallet(comp, wallet, { countRaw: 0n, qualifies: false, qualifyRaw: 0n });
-        if (note.disqualified) {
-          await notify(
-            `Disqualified\n<code>${escapeHtml(wallet)}</code>\nBalance dropped under the entry threshold.`,
-          );
-        }
+        if (note.disqualified) await announceDisqualified(wallet);
       } catch (err) {
         ctx.log.error("deferred balance refresh failed", { err });
         balanceRetries.add(job);
@@ -586,6 +578,7 @@ export function createEngine(ctx) {
       );
     });
     lines.push(`Disqualified: ${dq.length}`);
+    lines.push("", "Full addresses are above. Copy them for the giveaway.");
     return lines.join("\n");
   }
 
@@ -605,7 +598,120 @@ export function createEngine(ctx) {
     }
   }
 
-  async function startCompetition({ thresholdUi, durationDays, prize }) {
+  function renderAnnouncement(comp) {
+    return [
+      "🏆 <b>BUY COMP IS LIVE</b>",
+      "",
+      `${escapeHtml(symbol())} hold contest`,
+      "",
+      `Prize: <b>${escapeHtml(comp.prize_text)}</b>`,
+      `Entry: <b>${escapeHtml(formatUiString(comp.threshold_ui))}</b> ${escapeHtml(symbol())}`,
+      `Hold: <b>${escapeHtml(String(comp.duration_days))}</b> day(s)`,
+      `Ends: ${escapeHtml(formatTimestamp(Math.floor(comp.ends_at / 1000)))}`,
+      "",
+      "Buy at least the entry size and keep that balance until the end.",
+      "Drop under the line and you are out for good.",
+      "",
+      "Type /buycomplb in this chat for every entry and the time left.",
+    ].join("\n");
+  }
+
+  async function postToGroup(text, media) {
+    const chatId = ctx.db.getSetting("alert_chat_id");
+    if (chatId && ctx.telegram?.sendCard) {
+      try {
+        await ctx.telegram.sendCard(chatId, text, media?.type || "", media?.fileId || "");
+        return true;
+      } catch (err) {
+        ctx.log.error("group post failed", { err });
+      }
+    }
+    await notify(text);
+    return false;
+  }
+
+  async function announceCompetition(comp) {
+    if (!comp || comp.announced) return Boolean(comp?.announced);
+    const posted = await postToGroup(renderAnnouncement(comp), {
+      type: comp.media_type,
+      fileId: comp.media_file_id,
+    });
+    if (posted) ctx.db.markAnnounced(comp.id);
+    return posted;
+  }
+
+  async function announceActive() {
+    const comp = ctx.db.activeCompetition();
+    if (!comp || comp.announced) return false;
+    return announceCompetition(comp);
+  }
+
+  async function announceDisqualified(wallet) {
+    const url = `https://solscan.io/account/${wallet}`;
+    await notify(
+      [
+        "<b>Disqualified</b>",
+        `<code>${escapeHtml(wallet)}</code>`,
+        "Sold or transferred below the entry size. Out for good.",
+      ].join("\n"),
+    );
+    await postToGroup(
+      [
+        "🚫 <b>DISQUALIFIED</b>",
+        "",
+        `<a href="${url}">${escapeHtml(shortAddress(wallet))}</a>`,
+        "Balance dropped under the entry size.",
+      ].join("\n"),
+    );
+  }
+
+  async function announceEntry(wallet, comp, balanceRaw) {
+    const left = Math.max(0, comp.ends_at - Date.now());
+    const url = `https://solscan.io/account/${wallet}`;
+    const balance = balanceRaw == null ? "n/a" : formatRaw(balanceRaw, comp.decimals);
+    await postToGroup(
+      [
+        "🔥 <b>NEW ENTRY</b>",
+        "",
+        `<a href="${url}">${escapeHtml(shortAddress(wallet))}</a>`,
+        `Balance: <b>${escapeHtml(balance)}</b> ${escapeHtml(symbol())}`,
+        `Eligible in ${formatDuration(left)}`,
+      ].join("\n"),
+    );
+  }
+
+  function leaderboardText() {
+    const comp = ctx.db.activeCompetition();
+    if (!comp) return "No buy comp is running.";
+    const rows = ctx.db.competitors(comp.id, "eligible");
+    const closed = comp.status === "holding";
+    const leftMs = comp.ends_at - Date.now();
+    const left = formatDuration(Math.max(0, leftMs));
+    const lines = [
+      "<b>BUY COMP</b>",
+      escapeHtml(comp.prize_text),
+      `Entry ${escapeHtml(formatUiString(comp.threshold_ui))} ${escapeHtml(symbol())}`,
+      closed ? "Entries are closed. Hold is still being watched." : `Eligible in ${left}`,
+      "",
+    ];
+    if (!rows.length) {
+      lines.push("No entries yet. A wallet gets in when a buy leaves it at or above the entry size.");
+      return lines.join("\n");
+    }
+    lines.push(`${rows.length} still in. The hold ends at the same time for every wallet.`, "");
+    rows.forEach((row, index) => {
+      const url = `https://solscan.io/account/${row.wallet}`;
+      lines.push(
+        `${index + 1}. <a href="${url}">${escapeHtml(shortAddress(row.wallet))}</a>`,
+        `Balance ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))} ${escapeHtml(symbol())}`,
+        closed ? "Still holding" : `Eligible in ${left}`,
+        "",
+      );
+    });
+    return lines.join("\n").slice(0, 4000);
+  }
+
+  async function startCompetition({ thresholdUi, durationDays, prize, mediaType, mediaFileId }) {
     if (ctx.db.activeCompetition()) throw new Error("A competition is already running.");
     await ensureMeta();
     const dec = decimals();
@@ -623,8 +729,12 @@ export function createEngine(ctx) {
       prizeText: prize,
       startedAt,
       endsAt,
+      mediaType: mediaType || "",
+      mediaFileId: mediaFileId || "",
     });
-    ctx.log.info("competition started", { id, thresholdUi, durationDays });
+    const created = ctx.db.competition(id);
+    await announceCompetition(created);
+    ctx.log.info("competition started", { id, thresholdUi, durationDays, card: Boolean(mediaFileId) });
     return ctx.db.competition(id);
   }
 
@@ -635,10 +745,19 @@ export function createEngine(ctx) {
     ctx.db.setEndsAt(comp.id, endsAt);
     await refreshCompetitors();
     const fresh = ctx.db.competition(comp.id);
-    const text = competitionReport(fresh, "Buy comp finished early");
+    const text = competitionReport(fresh, "Giveaway list");
     for (const part of chunkText(text)) await notify(part);
     ctx.db.markSummarySent(comp.id);
     return fresh;
+  }
+
+  function stopCompetition() {
+    const comp = ctx.db.activeCompetition();
+    if (!comp) throw new Error("No competition is running.");
+    if (comp.status === "holding") throw new Error("Entries are already closed.");
+    ctx.db.setCompetitionStatus(comp.id, "holding");
+    ctx.log.info("competition entries closed", { id: comp.id });
+    return ctx.db.competition(comp.id);
   }
 
   function cancelCompetition() {
@@ -710,9 +829,12 @@ export function createEngine(ctx) {
     ensureMeta,
     startCompetition,
     endCompetitionNow,
+    stopCompetition,
     cancelCompetition,
     competitionReport,
     describeCompetitors,
+    leaderboardText,
+    announceActive,
     symbol,
     mint,
     decimals,
