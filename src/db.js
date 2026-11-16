@@ -62,6 +62,38 @@ CREATE TABLE IF NOT EXISTS outbox (
   payload TEXT NOT NULL,
   PRIMARY KEY (signature, wallet)
 );
+CREATE TABLE IF NOT EXISTS lottery_buys (
+  signature TEXT NOT NULL,
+  wallet TEXT NOT NULL,
+  lottery_id INTEGER NOT NULL,
+  PRIMARY KEY (signature, wallet)
+);
+CREATE TABLE IF NOT EXISTS lotteries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ticket_usd REAL NOT NULL,
+  tiers_json TEXT NOT NULL,
+  duration_days REAL NOT NULL,
+  prize_text TEXT NOT NULL,
+  decimals INTEGER NOT NULL,
+  started_at INTEGER NOT NULL,
+  ends_at INTEGER NOT NULL,
+  status TEXT NOT NULL,
+  winner TEXT,
+  draw_chat_id TEXT,
+  draw_message_id INTEGER,
+  draw_started_at INTEGER
+);
+CREATE TABLE IF NOT EXISTS lottery_wallets (
+  lottery_id INTEGER NOT NULL,
+  wallet TEXT NOT NULL,
+  tickets INTEGER NOT NULL DEFAULT 0,
+  tickets_earned INTEGER NOT NULL DEFAULT 0,
+  usd_spent REAL NOT NULL DEFAULT 0,
+  net_raw TEXT NOT NULL DEFAULT '0',
+  status TEXT NOT NULL,
+  disqualified_at INTEGER,
+  PRIMARY KEY (lottery_id, wallet)
+);
 `;
 
 export function openDatabase(filePath) {
@@ -284,6 +316,137 @@ export function openDatabase(filePath) {
     },
     dropOutbox(signature, wallet) {
       db.prepare("DELETE FROM outbox WHERE signature = ? AND wallet = ?").run(signature, wallet);
+    },
+    activeLottery() {
+      return db.prepare("SELECT * FROM lotteries WHERE status = 'active' ORDER BY id DESC LIMIT 1").get() || null;
+    },
+    drawingLottery() {
+      return db.prepare("SELECT * FROM lotteries WHERE status = 'drawing' ORDER BY id DESC LIMIT 1").get() || null;
+    },
+    liveLottery() {
+      return (
+        db.prepare("SELECT * FROM lotteries WHERE status IN ('active', 'drawing') ORDER BY id DESC LIMIT 1").get() ||
+        null
+      );
+    },
+    lottery(id) {
+      return db.prepare("SELECT * FROM lotteries WHERE id = ?").get(id) || null;
+    },
+    createLottery(row) {
+      const result = db
+        .prepare(
+          `INSERT INTO lotteries(ticket_usd, tiers_json, duration_days, prize_text, decimals, started_at, ends_at, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+        )
+        .run(row.ticketUsd, row.tiersJson, row.durationDays, row.prizeText, row.decimals, row.startedAt, row.endsAt);
+      return Number(result.lastInsertRowid);
+    },
+    setLotteryStatus(id, status) {
+      db.prepare("UPDATE lotteries SET status = ? WHERE id = ?").run(status, id);
+    },
+    setLotteryEndsAt(id, endsAt) {
+      db.prepare("UPDATE lotteries SET ends_at = ? WHERE id = ?").run(endsAt, id);
+    },
+    markDrawing(id, winner, startedAt) {
+      db.prepare("UPDATE lotteries SET status = 'drawing', winner = ?, draw_started_at = ? WHERE id = ?").run(
+        winner,
+        startedAt,
+        id,
+      );
+    },
+    setDrawMessage(id, chatId, messageId) {
+      db.prepare("UPDATE lotteries SET draw_chat_id = ?, draw_message_id = ? WHERE id = ?").run(
+        String(chatId),
+        messageId,
+        id,
+      );
+    },
+    finishLottery(id, winner) {
+      db.prepare("UPDATE lotteries SET status = 'completed', winner = ? WHERE id = ?").run(winner, id);
+    },
+    lotteryBuySeen(lotteryId, signature, wallet) {
+      return Boolean(
+        db
+          .prepare("SELECT 1 AS ok FROM lottery_buys WHERE lottery_id = ? AND signature = ? AND wallet = ?")
+          .get(lotteryId, signature, wallet),
+      );
+    },
+    awardLotteryBuy(row) {
+      const existing = this.lotteryWallet(row.lotteryId, row.wallet);
+      db.exec("BEGIN");
+      try {
+        const seen = db
+          .prepare("INSERT INTO lottery_buys(lottery_id, signature, wallet) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+          .run(row.lotteryId, row.signature, row.wallet);
+        if (seen.changes !== 1 || existing?.status === "disqualified") {
+          db.exec("COMMIT");
+          return null;
+        }
+        const saved = this.addLotteryTickets(row);
+        db.exec("COMMIT");
+        return saved;
+      } catch (err) {
+        db.exec("ROLLBACK");
+        throw err;
+      }
+    },
+    markLotteryBuy(lotteryId, signature, wallet) {
+      const result = db
+        .prepare("INSERT INTO lottery_buys(lottery_id, signature, wallet) VALUES (?, ?, ?) ON CONFLICT DO NOTHING")
+        .run(lotteryId, signature, wallet);
+      return result.changes === 1;
+    },
+    lotteryWallet(lotteryId, wallet) {
+      return (
+        db.prepare("SELECT * FROM lottery_wallets WHERE lottery_id = ? AND wallet = ?").get(lotteryId, wallet) ||
+        null
+      );
+    },
+    lotteryWallets(lotteryId, status = null) {
+      if (status) {
+        return db
+          .prepare(
+            "SELECT * FROM lottery_wallets WHERE lottery_id = ? AND status = ? ORDER BY tickets DESC, wallet ASC",
+          )
+          .all(lotteryId, status);
+      }
+      return db
+        .prepare("SELECT * FROM lottery_wallets WHERE lottery_id = ? ORDER BY tickets DESC, wallet ASC")
+        .all(lotteryId);
+    },
+    addLotteryTickets(row) {
+      const existing = this.lotteryWallet(row.lotteryId, row.wallet);
+      if (existing?.status === "disqualified") return existing;
+      const tickets = (existing?.tickets || 0) + row.tickets;
+      const earned = (existing?.tickets_earned || 0) + row.tickets;
+      const usd = Number(existing?.usd_spent || 0) + Number(row.usd || 0);
+      const net = (BigInt(existing?.net_raw || "0") + BigInt(row.netRaw || "0")).toString();
+      db.prepare(
+        `INSERT INTO lottery_wallets(lottery_id, wallet, tickets, tickets_earned, usd_spent, net_raw, status, disqualified_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'eligible', NULL)
+         ON CONFLICT(lottery_id, wallet) DO UPDATE SET
+           tickets = excluded.tickets,
+           tickets_earned = excluded.tickets_earned,
+           usd_spent = excluded.usd_spent,
+           net_raw = excluded.net_raw`,
+      ).run(row.lotteryId, row.wallet, tickets, earned, usd, net);
+      return this.lotteryWallet(row.lotteryId, row.wallet);
+    },
+    disqualifyLotteryWallet(row) {
+      const existing = this.lotteryWallet(row.lotteryId, row.wallet);
+      const earned = existing?.tickets_earned || 0;
+      const net = (BigInt(existing?.net_raw || "0") - BigInt(row.soldRaw || "0")).toString();
+      const hadTickets = (existing?.tickets || 0) > 0;
+      db.prepare(
+        `INSERT INTO lottery_wallets(lottery_id, wallet, tickets, tickets_earned, usd_spent, net_raw, status, disqualified_at)
+         VALUES (?, ?, 0, ?, ?, ?, 'disqualified', ?)
+         ON CONFLICT(lottery_id, wallet) DO UPDATE SET
+           tickets = 0,
+           net_raw = excluded.net_raw,
+           status = 'disqualified',
+           disqualified_at = excluded.disqualified_at`,
+      ).run(row.lotteryId, row.wallet, earned, Number(existing?.usd_spent || 0), net, row.at);
+      return { hadTickets, earned };
     },
   };
 }

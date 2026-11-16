@@ -2,6 +2,7 @@ import { wsUrl, createChain, syncHeliusWebhook } from "./chain.js";
 import { parseEnhancedTransaction, parseRawTransaction, normalizeAmount, uiApproxRaw } from "./parse.js";
 import { createPrices } from "./prices.js";
 import { decideEntry } from "./rules.js";
+import { DRAW_MS, pickWinner, renderLeaderboard, renderSpin, spinCursor, ticketsForBuy } from "./lottery.js";
 import {
   chunkText,
   emojiBar,
@@ -163,7 +164,8 @@ export function createEngine(ctx) {
       if (buyRaw > 0n) ctx.db.recordBuy(parsed.signature, wallet, buyRaw.toString());
       notes.push({ wallet, ...note });
     }
-    return notes;
+    const lotteryNotes = await applyLottery(parsed);
+    return [...notes, ...lotteryNotes];
   }
 
   function settleWallet(comp, wallet, { buyRaw, sellRaw }) {
@@ -201,6 +203,55 @@ export function createEngine(ctx) {
       disqualifiedAt,
     });
     return { entered, disqualified, positionRaw: position, boughtRaw: bought };
+  }
+
+  async function applyLottery(parsed) {
+    const lot = ctx.db.activeLottery();
+    if (!lot) return [];
+    const tiers = JSON.parse(lot.tiers_json || "[]");
+    const dec = lot.decimals;
+    const notes = [];
+    const boughtSum = (parsed.buys || []).reduce((sum, buy) => sum + BigInt(buy.amountRaw || "0"), 0n);
+    for (const change of parsed.changes || []) {
+      if (!(change.deltaUi < 0)) continue;
+      const soldRaw = BigInt(uiApproxRaw(Math.abs(change.deltaUi), dec));
+      if (soldRaw <= 0n) continue;
+      const existing = ctx.db.lotteryWallet(lot.id, change.wallet);
+      if (!existing && boughtSum > 0n && soldRaw === boughtSum) continue;
+      const result = ctx.db.disqualifyLotteryWallet({
+        lotteryId: lot.id,
+        wallet: change.wallet,
+        soldRaw: soldRaw.toString(),
+        at: Date.now(),
+      });
+      if (result.hadTickets) notes.push({ type: "lottery-out", wallet: change.wallet, earned: result.earned });
+    }
+    for (const buy of parsed.buys || []) {
+      const row = ctx.db.lotteryWallet(lot.id, buy.wallet);
+      if (row?.status === "disqualified") {
+        ctx.db.markLotteryBuy(lot.id, parsed.signature, buy.wallet);
+        continue;
+      }
+      if (ctx.db.lotteryBuySeen(lot.id, parsed.signature, buy.wallet)) continue;
+      const usd = await priceOf(buy);
+      if (usd == null) throw new Error("token price unavailable for lottery tickets");
+      const math = ticketsForBuy(usd, lot.ticket_usd, tiers);
+      if (math.total <= 0) {
+        ctx.db.markLotteryBuy(lot.id, parsed.signature, buy.wallet);
+        continue;
+      }
+      const saved = ctx.db.awardLotteryBuy({
+        lotteryId: lot.id,
+        signature: parsed.signature,
+        wallet: buy.wallet,
+        tickets: math.total,
+        usd,
+        netRaw: buy.amountRaw,
+      });
+      if (!saved) continue;
+      notes.push({ type: "lottery-tickets", wallet: buy.wallet, added: math.total, total: saved.tickets });
+    }
+    return notes;
   }
 
   async function notify(text) {
@@ -349,7 +400,11 @@ export function createEngine(ctx) {
       await queueAlerts(parsed);
       status.lastTxAt = parsed.timestamp ? parsed.timestamp * 1000 : Date.now();
       for (const note of notes) {
-        if (note.entered) {
+        if (note.type === "lottery-tickets") {
+          await announceLotteryTickets(note);
+        } else if (note.type === "lottery-out") {
+          await announceLotteryOut(note);
+        } else if (note.entered) {
           const comp = ctx.db.activeCompetition();
           if (comp) await announceEntry(note.wallet, comp, note.positionRaw);
         } else if (note.disqualified) {
@@ -685,6 +740,20 @@ export function createEngine(ctx) {
     );
   }
 
+  async function announceLotteryTickets(note) {
+    const url = `https://solscan.io/account/${note.wallet}`;
+    await postToGroup(
+      `🎟 <a href="${url}">${escapeHtml(shortAddress(note.wallet))}</a> · ${note.total} tickets`,
+    );
+  }
+
+  async function announceLotteryOut(note) {
+    const url = `https://solscan.io/account/${note.wallet}`;
+    await postToGroup(
+      `🚫 <a href="${url}">${escapeHtml(shortAddress(note.wallet))}</a> sold. ${note.earned} tickets burned.`,
+    );
+  }
+
   function leaderboardText() {
     const comp = ctx.db.activeCompetition();
     if (!comp) return "No buy comp is running.";
@@ -789,6 +858,232 @@ export function createEngine(ctx) {
     return lines.join("\n\n");
   }
 
+  let lotteryBusy = false;
+  let lotteryEditAt = 0;
+
+  function lotteryTiers(lot) {
+    try {
+      const parsed = JSON.parse(lot.tiers_json || "[]");
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+
+  function lotteryEntrants(lot) {
+    return ctx.db
+      .lotteryWallets(lot.id, "eligible")
+      .filter((row) => row.tickets > 0)
+      .sort((a, b) => b.tickets - a.tickets || a.wallet.localeCompare(b.wallet));
+  }
+
+  async function postLotteryText(text) {
+    const chatId = ctx.db.getSetting("alert_chat_id");
+    if (chatId && ctx.telegram?.sendCard) {
+      try {
+        return await ctx.telegram.sendCard(chatId, text, "", "");
+      } catch (err) {
+        ctx.log.error("lottery group post failed", { err });
+      }
+    }
+    await notify(text);
+    return null;
+  }
+
+  function renderLotteryCard(lot) {
+    const tiers = lotteryTiers(lot);
+    const lines = [
+      "🎰 <b>TRENCH LOTTERY</b>",
+      "",
+      `Ticket: <b>$${escapeHtml(String(lot.ticket_usd))}</b>`,
+      `Prize: <b>${escapeHtml(lot.prize_text)}</b>`,
+      `Ends: ${escapeHtml(formatTimestamp(Math.floor(lot.ends_at / 1000)))}`,
+      "",
+      "Buys after this message earn one ticket per ticket price.",
+      "Any sell burns every ticket.",
+      "",
+      "/lotterylb",
+    ];
+    if (tiers.length) {
+      lines.splice(4, 0, tiers.map((tier) => `$${tier.min}+ bonus +${tier.bonus}`).join("\n"));
+    }
+    return lines.join("\n");
+  }
+
+  async function startLottery({ ticketUsd, durationDays, prize, tiers }) {
+    if (ctx.db.liveLottery()) throw new Error("A Trench Lottery is already running.");
+    await ensureMeta();
+    const dec = decimals();
+    if (dec == null) throw new Error("Token decimals are not loaded yet. Set the mint and try again in a few seconds.");
+    const price = Number(ticketUsd);
+    if (!(price > 0)) throw new Error("Ticket price must be greater than zero.");
+    const startedAt = Date.now();
+    const endsAt = startedAt + Math.round(Number(durationDays) * 86_400_000);
+    const id = ctx.db.createLottery({
+      ticketUsd: price,
+      tiersJson: JSON.stringify(tiers || []),
+      durationDays,
+      prizeText: prize,
+      decimals: dec,
+      startedAt,
+      endsAt,
+    });
+    const lot = ctx.db.lottery(id);
+    await postLotteryText(renderLotteryCard(lot));
+    ctx.log.info("lottery started", { id, ticketUsd: price, durationDays });
+    return lot;
+  }
+
+  async function beginDraw(lot) {
+    const fresh = ctx.db.lottery(lot.id);
+    if (!fresh || fresh.status === "completed" || fresh.status === "cancelled") return fresh;
+    const entrants = lotteryEntrants(fresh);
+    if (!entrants.length) {
+      await postLotteryText("🎰 Trench Lottery closed. No tickets were in the draw.");
+      ctx.db.finishLottery(fresh.id, null);
+      return ctx.db.lottery(fresh.id);
+    }
+    const winner = fresh.winner || pickWinner(entrants.map((row) => ({ wallet: row.wallet, tickets: row.tickets })));
+    const started = fresh.draw_started_at || Date.now();
+    if (fresh.status !== "drawing") ctx.db.markDrawing(fresh.id, winner, started);
+    let current = ctx.db.lottery(fresh.id);
+    if (!current.draw_message_id) {
+      const text = renderSpin({
+        prize: current.prize_text,
+        wallets: entrants,
+        cursor: spinCursor(0, entrants.length, entrants.findIndex((row) => row.wallet === winner)),
+        remainMs: DRAW_MS,
+        winner,
+        done: false,
+      });
+      const message = await postLotteryText(text);
+      const chatId = ctx.db.getSetting("alert_chat_id") || message?.chat?.id || "0";
+      ctx.db.setDrawMessage(current.id, chatId, message?.message_id || -1);
+      current = ctx.db.lottery(fresh.id);
+    }
+    return current;
+  }
+
+  async function stepDrawing(lot) {
+    const entrants = lotteryEntrants(lot);
+    const winner = lot.winner;
+    const winnerIndex = Math.max(0, entrants.findIndex((row) => row.wallet === winner));
+    const elapsed = Date.now() - (lot.draw_started_at || Date.now());
+    const remain = DRAW_MS - elapsed;
+    const done = remain <= 0;
+    const text = renderSpin({
+      prize: lot.prize_text,
+      wallets: entrants,
+      cursor: spinCursor(elapsed, entrants.length, winnerIndex),
+      remainMs: remain,
+      winner,
+      done,
+    });
+    if (lot.draw_message_id > 0 && ctx.telegram?.editMessage) {
+      if (!done && Date.now() - lotteryEditAt < 1100) return;
+      try {
+        await ctx.telegram.editMessage(lot.draw_chat_id, lot.draw_message_id, text);
+        lotteryEditAt = Date.now();
+      } catch (err) {
+        if (!/not modified/i.test(String(err.message || ""))) ctx.log.warn("lottery edit failed", { err });
+      }
+    }
+    if (!done) return;
+    const winnerRow = entrants.find((row) => row.wallet === winner);
+    const congrats = [
+      "🏆 <b>WINNER</b>",
+      `<code>${escapeHtml(winner)}</code>`,
+      `Tickets: ${winnerRow?.tickets || 0}`,
+      `Prize: ${escapeHtml(lot.prize_text)}`,
+    ].join("\n");
+    await postLotteryText(congrats);
+    if (lot.draw_message_id > 0 && ctx.telegram?.pinMessage) {
+      try {
+        await ctx.telegram.pinMessage(lot.draw_chat_id, lot.draw_message_id);
+      } catch (err) {
+        ctx.log.warn("could not pin the draw. Make the bot a group admin.", { err });
+      }
+    }
+    ctx.db.finishLottery(lot.id, winner);
+    ctx.log.info("lottery drawn", { id: lot.id, winner });
+  }
+
+  async function pumpLottery() {
+    if (lotteryBusy) return;
+    lotteryBusy = true;
+    try {
+      const drawing = ctx.db.drawingLottery();
+      if (drawing) {
+        if (!drawing.draw_message_id) await beginDraw(drawing);
+        else await stepDrawing(ctx.db.lottery(drawing.id));
+        return;
+      }
+      const active = ctx.db.activeLottery();
+      if (active && active.ends_at <= Date.now()) await beginDraw(active);
+    } finally {
+      lotteryBusy = false;
+    }
+  }
+
+  async function endLotteryNow() {
+    const lot = ctx.db.liveLottery();
+    if (!lot) throw new Error("No Trench Lottery is running.");
+    if (lot.status === "drawing") throw new Error("The draw is already spinning.");
+    ctx.db.setLotteryEndsAt(lot.id, Date.now() - 1);
+    await beginDraw(ctx.db.lottery(lot.id));
+    return ctx.db.lottery(lot.id);
+  }
+
+  function cancelLottery() {
+    const lot = ctx.db.liveLottery();
+    if (!lot) throw new Error("No Trench Lottery is running.");
+    if (lot.status === "drawing") throw new Error("The draw has started. Let it finish.");
+    ctx.db.setLotteryStatus(lot.id, "cancelled");
+    ctx.log.info("lottery cancelled", { id: lot.id });
+    return lot;
+  }
+
+  function lotteryStatusText() {
+    const lot = ctx.db.liveLottery();
+    if (!lot) return "No Trench Lottery is running.";
+    const entrants = lotteryEntrants(lot);
+    const tickets = entrants.reduce((sum, row) => sum + row.tickets, 0);
+    const dq = ctx.db.lotteryWallets(lot.id, "disqualified").length;
+    const left = lot.status === "drawing" ? "Drawing now" : formatDuration(lot.ends_at - Date.now());
+    return [
+      "<b>Trench Lottery</b>",
+      `Prize: ${escapeHtml(lot.prize_text)}`,
+      `Ticket: $${escapeHtml(String(lot.ticket_usd))}`,
+      `Time: ${left}`,
+      `Wallets: ${entrants.length}`,
+      `Tickets: ${tickets}`,
+      `Burned: ${dq}`,
+    ].join("\n");
+  }
+
+  function describeLottery(kind) {
+    const lot = ctx.db.liveLottery();
+    if (!lot) return "No Trench Lottery is running.";
+    const rows = ctx.db.lotteryWallets(lot.id, kind);
+    if (!rows.length) return kind === "eligible" ? "No tickets yet." : "Nobody has sold.";
+    return rows
+      .map((row) => {
+        const net = formatTokenUi(Number(row.net_raw) / 10 ** lot.decimals);
+        return [
+          `<code>${escapeHtml(row.wallet)}</code>`,
+          kind === "eligible" ? `${row.tickets} tickets · net ${net}` : `Burned ${row.tickets_earned} · net ${net}`,
+        ].join("\n");
+      })
+      .join("\n\n")
+      .slice(0, 3900);
+  }
+
+  function lotteryBoard() {
+    const lot = ctx.db.liveLottery();
+    if (!lot) return "No Trench Lottery is running.";
+    return renderLeaderboard(ctx.db.lotteryWallets(lot.id, "eligible"));
+  }
+
   function start() {
     running = true;
     ctx.db.resetStuck();
@@ -811,6 +1106,7 @@ export function createEngine(ctx) {
       setInterval(() => refreshCompetitors().catch((err) => ctx.log.error("refresh failed", { err })), 45_000),
       setInterval(() => drainBalanceRetries().catch((err) => ctx.log.error("retry refresh failed", { err })), 20_000),
       setInterval(() => closeDueCompetitions().catch((err) => ctx.log.error("comp clock failed", { err })), 15_000),
+      setInterval(() => pumpLottery().catch((err) => ctx.log.error("lottery clock failed", { err })), 1000),
       setInterval(() => syncWebhook(), 10 * 60_000),
     ];
     status.timers = timers;
@@ -842,6 +1138,12 @@ export function createEngine(ctx) {
     describeCompetitors,
     leaderboardText,
     announceActive,
+    startLottery,
+    endLotteryNow,
+    cancelLottery,
+    lotteryStatusText,
+    describeLottery,
+    lotteryBoard,
     symbol,
     mint,
     decimals,

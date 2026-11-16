@@ -1,4 +1,5 @@
 import { escapeHtml, formatDuration, formatUiString, isMintAddress, parseDays, parseTokenAmount, parseUsd, shortAddress } from "./format.js";
+import { ticketsForBuy } from "./lottery.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -32,6 +33,15 @@ function validUrl(value) {
   return url;
 }
 
+function parseTierLine(text) {
+  const match = String(text).trim().replace(/[$,]/g, "").match(/^(\d+(?:\.\d{1,2})?)\s+(\d+)$/);
+  if (!match) return null;
+  const min = Number(match[1]);
+  const bonus = Number(match[2]);
+  if (!(min > 0) || bonus < 0 || bonus > 100000) return null;
+  return { min, bonus };
+}
+
 function keyboard(rows) {
   return { inline_keyboard: rows };
 }
@@ -43,9 +53,10 @@ function homeKeyboard() {
       { text: "Buy comp", callback_data: "m:comp" },
     ],
     [
+      { text: "Lottery", callback_data: "m:lot" },
       { text: "Status", callback_data: "m:status" },
-      { text: "Help", callback_data: "m:help" },
     ],
+    [{ text: "Help", callback_data: "m:help" }],
   ]);
 }
 
@@ -228,6 +239,43 @@ export function createTelegram(ctx) {
     ].filter((row) => row.length));
   }
 
+  function lotteryKeyboard() {
+    const live = ctx.db.liveLottery();
+    if (!live) {
+      return keyboard([
+        [{ text: "Start lottery", callback_data: "l:start" }],
+        [{ text: "Back", callback_data: "m:home" }],
+      ]);
+    }
+    if (live.status === "drawing") {
+      return keyboard([
+        [{ text: "Refresh", callback_data: "m:lot" }],
+        [{ text: "Back", callback_data: "m:home" }],
+      ]);
+    }
+    return keyboard([
+      [
+        { text: "Tickets", callback_data: "l:elig" },
+        { text: "Burned", callback_data: "l:dq" },
+      ],
+      [
+        { text: "Draw now", callback_data: "l:end" },
+        { text: "Abort", callback_data: "l:cancel" },
+      ],
+      [{ text: "Back", callback_data: "m:home" }],
+    ]);
+  }
+
+  function lotteryTierPreview(price, tiers) {
+    if (!tiers?.length) return "No bonus tiers.";
+    return tiers
+      .map((tier) => {
+        const sample = ticketsForBuy(tier.min, price, tiers);
+        return `$${tier.min}+ adds ${tier.bonus} · a $${tier.min} buy earns ${sample.total}`;
+      })
+      .join("\n");
+  }
+
   function statusText() {
     const mint = ctx.engine.mint() || "not set";
     const lastTx = ctx.status.lastTxAt ? new Date(ctx.status.lastTxAt).toISOString() : "none yet";
@@ -263,6 +311,10 @@ export function createTelegram(ctx) {
       "/stopcomp — close entries, keep watching holders",
       "/endcomp — winner list with full addresses",
       "/cancelcomp — abort the competition",
+      "/lottery — Trench Lottery",
+      "/lotterylb — ticket list, including in the group",
+      "/endlottery — draw the lottery now",
+      "/cancellottery — abort the lottery",
       "/status — stream health",
       "/help — this note",
       "/setchat — use inside the alert group",
@@ -306,6 +358,24 @@ export function createTelegram(ctx) {
       });
     }
     return sendText(chatId, text);
+  }
+
+  async function editMessage(chatId, messageId, text) {
+    return tg("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      parse_mode: "HTML",
+      link_preview_options: { is_disabled: true },
+    });
+  }
+
+  async function pinMessage(chatId, messageId) {
+    return tg("pinChatMessage", {
+      chat_id: chatId,
+      message_id: messageId,
+      disable_notification: false,
+    });
   }
 
   function confirmText(draft) {
@@ -366,6 +436,7 @@ export function createTelegram(ctx) {
     if (data === "m:help") return show(update, helpText(), keyboard([[{ text: "Back", callback_data: "m:home" }]]));
     if (data === "m:status") return show(update, statusText(), keyboard([[{ text: "Back", callback_data: "m:home" }]]));
     if (data === "m:comp") return show(update, compText(), compKeyboard());
+    if (data === "m:lot") return show(update, ctx.engine.lotteryStatusText(), lotteryKeyboard());
     if (data === "s:min") {
       ctx.db.setSession(fromId, "min");
       return show(update, "Send the minimum buy in US dollars. Example: <code>10</code> or <code>25.50</code>. Buys under that are ignored. Send <code>0</code> to post every buy.", keyboard([[{ text: "Back", callback_data: "m:set" }]]));
@@ -494,7 +565,79 @@ export function createTelegram(ctx) {
       ctx.db.clearSession(fromId);
       return show(update, compText(), compKeyboard());
     }
+    if (data === "l:start") {
+      ctx.db.setSession(fromId, "lot_price", {});
+      return show(update, "Ticket price in US dollars. A $50 buy at <code>25</code> earns 2 tickets. A $76 buy earns 3.", keyboard([[{ text: "Back", callback_data: "m:lot" }]]));
+    }
+    if (data === "l:elig" || data === "l:dq") {
+      const kind = data === "l:elig" ? "eligible" : "disqualified";
+      return show(update, ctx.engine.describeLottery(kind), lotteryKeyboard());
+    }
+    if (data === "l:end") {
+      try {
+        await ctx.engine.endLotteryNow();
+        return show(update, "The draw is spinning in the alert group. It takes five minutes.", lotteryKeyboard());
+      } catch (err) {
+        return show(update, escapeHtml(err.message), lotteryKeyboard());
+      }
+    }
+    if (data === "l:cancel") {
+      try {
+        ctx.engine.cancelLottery();
+        return show(update, "Lottery aborted. No draw.", lotteryKeyboard());
+      } catch (err) {
+        return show(update, escapeHtml(err.message), lotteryKeyboard());
+      }
+    }
+    if (data.startsWith("ld:")) {
+      const session = ctx.db.session(fromId);
+      if (data === "ld:custom") {
+        ctx.db.setSession(fromId, "lot_days", session.data || {});
+        return show(update, "How many days should the lottery run? Example: <code>12</code> or <code>0.5</code>.", keyboard([[{ text: "Back", callback_data: "m:lot" }]]));
+      }
+      const days = Number(data.slice(3));
+      const draft = { ...(session.data || {}), durationDays: days, tiers: [] };
+      ctx.db.setSession(fromId, "lot_tiers", draft);
+      return show(update, lotteryTierPrompt(draft), keyboard([[{ text: "No bonus tiers", callback_data: "l:notiers" }]]));
+    }
+    if (data === "l:notiers") {
+      const draft = { ...(ctx.db.session(fromId).data || {}), tiers: [] };
+      ctx.db.setSession(fromId, "lot_prize", draft);
+      return show(update, "Prize text. Example: <code>$25 of SOL</code>. This is a label, not a payment.", keyboard([[{ text: "Back", callback_data: "m:lot" }]]));
+    }
+    if (data === "lx:yes") {
+      const draft = ctx.db.session(fromId).data || {};
+      try {
+        const lot = await ctx.engine.startLottery({
+          ticketUsd: draft.ticketUsd,
+          durationDays: draft.durationDays,
+          prize: draft.prize,
+          tiers: draft.tiers || [],
+        });
+        ctx.db.clearSession(fromId);
+        return show(update, `Trench Lottery #${lot.id} is live. Only buys from now on count. Any sell burns that wallet.`, lotteryKeyboard());
+      } catch (err) {
+        return show(update, escapeHtml(err.message), lotteryKeyboard());
+      }
+    }
+    if (data === "lx:no") {
+      ctx.db.clearSession(fromId);
+      return show(update, ctx.engine.lotteryStatusText(), lotteryKeyboard());
+    }
     await tg("answerCallbackQuery", { callback_query_id: query.id });
+  }
+
+  function lotteryTierPrompt(draft) {
+    return [
+      `Ticket is $${draft.ticketUsd}. ${draft.durationDays} day(s).`,
+      "",
+      "Bonus tiers stack on top of the base tickets. Highest match wins.",
+      "Send <code>100 1</code> if a $100 buy should get its 4 base tickets plus 1 bonus.",
+      "Send <code>500 10</code> if a $500 buy should get 20 base plus 10, which is 30.",
+      "Send <code>done</code> when the list is finished.",
+      "",
+      lotteryTierPreview(draft.ticketUsd, draft.tiers || []),
+    ].join("\n");
   }
 
   function homeText(isOperator) {
@@ -506,7 +649,7 @@ export function createTelegram(ctx) {
       "<b>Buywire</b>",
       mint ? `Watching <code>${escapeHtml(shortAddress(mint))}</code>` : "No mint set yet. Open Settings.",
       "",
-      "Buy alerts, the minimum size, and the hold competition live here.",
+      "Buy alerts, the hold competition, and Trench Lottery live here.",
     ].join("\n");
   }
 
@@ -537,8 +680,12 @@ export function createTelegram(ctx) {
       await sendText(chat.id, ctx.engine.leaderboardText());
       return;
     }
+    if (command === "/lotterylb") {
+      await sendText(chat.id, ctx.engine.lotteryBoard());
+      return;
+    }
 
-    if (command === "/stopcomp" || command === "/endcomp" || command === "/cancelcomp") {
+    if (command === "/stopcomp" || command === "/endcomp" || command === "/cancelcomp" || command === "/endlottery" || command === "/cancellottery") {
       if (chat.type !== "private") {
         await sendText(chat.id, "Send that in a private chat with me. The winner list is not posted here.");
         return;
@@ -556,6 +703,16 @@ export function createTelegram(ctx) {
         if (command === "/cancelcomp") {
           ctx.engine.cancelCompetition();
           await sendText(chat.id, "Competition aborted. No winner list was sent.");
+          return;
+        }
+        if (command === "/cancellottery") {
+          ctx.engine.cancelLottery();
+          await sendText(chat.id, "Lottery aborted. No draw.");
+          return;
+        }
+        if (command === "/endlottery") {
+          await ctx.engine.endLotteryNow();
+          await sendText(chat.id, "The draw is spinning in the alert group. It takes five minutes.");
           return;
         }
         await ctx.engine.endCompetitionNow();
@@ -594,6 +751,7 @@ export function createTelegram(ctx) {
     }
     if (command === "/settings") return sendText(chat.id, settingsText(), settingsKeyboard());
     if (command === "/comp") return sendText(chat.id, compText(), compKeyboard());
+    if (command === "/lottery") return sendText(chat.id, ctx.engine.lotteryStatusText(), lotteryKeyboard());
     if (command === "/buycomplb") return sendText(chat.id, ctx.engine.leaderboardText());
     if (command === "/status") return sendText(chat.id, statusText(), keyboard([[{ text: "Menu", callback_data: "m:home" }]]));
 
@@ -714,6 +872,89 @@ export function createTelegram(ctx) {
       ctx.db.setSetting("admin_ids", [...ids].join(","));
       ctx.db.clearSession(fromId);
       await sendText(chat.id, `Operator ${text} added.`, settingsKeyboard());
+      return;
+    }
+    if (session.state === "lot_price") {
+      const price = parseUsd(text);
+      if (!price || Number(price) <= 0) {
+        await sendText(chat.id, "Send a dollar amount like <code>25</code>.");
+        return;
+      }
+      ctx.db.setSession(fromId, "lot_duration", { ticketUsd: price });
+      await sendText(
+        chat.id,
+        "How long does the lottery run? Everyone shares this countdown.",
+        keyboard([
+          [
+            { text: "1 day", callback_data: "ld:1" },
+            { text: "3 days", callback_data: "ld:3" },
+            { text: "1 week", callback_data: "ld:7" },
+          ],
+          [
+            { text: "15 days", callback_data: "ld:15" },
+            { text: "30 days", callback_data: "ld:30" },
+          ],
+          [{ text: "Custom days", callback_data: "ld:custom" }],
+        ]),
+      );
+      return;
+    }
+    if (session.state === "lot_days") {
+      const days = parseDays(text);
+      if (!days) {
+        await sendText(chat.id, "Send a positive number of days, up to 3650.");
+        return;
+      }
+      const draft = { ...(session.data || {}), durationDays: days, tiers: [] };
+      ctx.db.setSession(fromId, "lot_tiers", draft);
+      await sendText(chat.id, lotteryTierPrompt(draft), keyboard([[{ text: "No bonus tiers", callback_data: "l:notiers" }]]));
+      return;
+    }
+    if (session.state === "lot_tiers") {
+      if (/^done$/i.test(text)) {
+        const draft = session.data || {};
+        ctx.db.setSession(fromId, "lot_prize", draft);
+        await sendText(chat.id, "Prize text. Example: <code>$25 of SOL</code>. This is a label, not a payment.");
+        return;
+      }
+      const tier = parseTierLine(text);
+      if (!tier) {
+        await sendText(chat.id, "Send <code>100 1</code>, or <code>done</code>.");
+        return;
+      }
+      const tiers = [...(session.data?.tiers || []).filter((row) => Number(row.min) !== tier.min), tier].sort(
+        (a, b) => a.min - b.min,
+      );
+      const draft = { ...(session.data || {}), tiers };
+      ctx.db.setSession(fromId, "lot_tiers", draft);
+      await sendText(chat.id, lotteryTierPrompt(draft));
+      return;
+    }
+    if (session.state === "lot_prize") {
+      if (!text || text.length > 300) {
+        await sendText(chat.id, "Send a short prize description.");
+        return;
+      }
+      const draft = { ...(session.data || {}), prize: text };
+      ctx.db.setSession(fromId, "lot_confirm", draft);
+      await sendText(
+        chat.id,
+        [
+          "<b>Start this lottery?</b>",
+          `Ticket: $${escapeHtml(String(draft.ticketUsd))}`,
+          `Length: ${draft.durationDays} day(s)`,
+          `Prize: ${escapeHtml(draft.prize)}`,
+          lotteryTierPreview(draft.ticketUsd, draft.tiers || []),
+          "",
+          "Only buys after the start count. Any sell burns that wallet's tickets.",
+        ].join("\n"),
+        keyboard([
+          [
+            { text: "Start", callback_data: "lx:yes" },
+            { text: "Cancel", callback_data: "lx:no" },
+          ],
+        ]),
+      );
       return;
     }
     if (session.state === "comp_threshold") {
@@ -848,6 +1089,8 @@ export function createTelegram(ctx) {
   return {
     sendAlert,
     sendCard,
+    editMessage,
+    pinMessage,
     notifyAdmins,
     async start() {
       if (!token) {
@@ -868,6 +1111,10 @@ export function createTelegram(ctx) {
             { command: "stopcomp", description: "Close entries, keep watching" },
             { command: "endcomp", description: "Winner list with full addresses" },
             { command: "cancelcomp", description: "Abort the competition" },
+            { command: "lottery", description: "Trench Lottery" },
+            { command: "lotterylb", description: "Lottery ticket list" },
+            { command: "endlottery", description: "Draw the lottery now" },
+            { command: "cancellottery", description: "Abort the lottery" },
             { command: "status", description: "Stream health" },
             { command: "help", description: "How Buywire works" },
             { command: "setchat", description: "Post alerts in this chat" },
@@ -878,6 +1125,7 @@ export function createTelegram(ctx) {
           scope: { type: "all_group_chats" },
           commands: [
             { command: "buycomplb", description: "Entries and time left" },
+            { command: "lotterylb", description: "Lottery ticket list" },
             { command: "setchat", description: "Post alerts in this chat" },
           ],
         }).catch((err) => ctx.log.warn("setMyCommands group scope failed", { err }));
