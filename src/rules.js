@@ -8,17 +8,20 @@
  */
 
 /**
- * @param {{ status?: string, balanceRaw: bigint, thresholdRaw: bigint, buyRaw: bigint, entriesOpen?: boolean }} input
+ * A wallet enters on tokens bought after the competition started, not on the
+ * bag it already held. Selling those tokens back under the line is final.
+ *
+ * @param {{ status?: string, positionRaw: bigint, thresholdRaw: bigint, entriesOpen?: boolean }} input
  * @returns {"watching" | "eligible" | "disqualified"}
  */
-export function decideEntry({ status, balanceRaw, thresholdRaw, buyRaw, entriesOpen = true }) {
+export function decideEntry({ status, positionRaw, thresholdRaw, entriesOpen = true }) {
   const current = status || "watching";
   if (current === "disqualified") return "disqualified";
   if (current === "eligible") {
-    return balanceRaw < thresholdRaw ? "disqualified" : "eligible";
+    return positionRaw < thresholdRaw ? "disqualified" : "eligible";
   }
   if (!entriesOpen) return "watching";
-  if (buyRaw > 0n && balanceRaw >= thresholdRaw) return "eligible";
+  if (positionRaw >= thresholdRaw) return "eligible";
   return "watching";
 }
 

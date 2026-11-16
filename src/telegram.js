@@ -1,4 +1,4 @@
-import { escapeHtml, formatDuration, formatUiString, isMintAddress, parseDays, parseTokenAmount, shortAddress } from "./format.js";
+import { escapeHtml, formatDuration, formatUiString, isMintAddress, parseDays, parseTokenAmount, parseUsd, shortAddress } from "./format.js";
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,6 +24,12 @@ async function callTelegram(token, method, body, timeoutMs = 30_000, attempt = 0
     throw error;
   }
   return json.result;
+}
+
+function validUrl(value) {
+  const url = String(value || "").trim();
+  if (!/^https:\/\/\S+$/i.test(url) || url.length > 300) return "";
+  return url;
 }
 
 function keyboard(rows) {
@@ -116,25 +122,29 @@ export function createTelegram(ctx) {
     }
     if (!tiers.length) return "No tiers yet.";
     return tiers
-      .map((tier, index) => `${index + 1}. ${tier.emoji} at ${formatUiString(tier.min)}+`)
+      .map((tier, index) => `${index + 1}. ${tier.emoji} at $${formatUiString(tier.min)}+`)
       .join("\n");
   }
 
   function settingsText() {
-    const min = ctx.db.getSetting("min_buy_ui") || "0";
+    const min = ctx.db.getSetting("min_buy_usd") || "0";
     const mode = ctx.db.getSetting("emoji_mode") || "tiers";
     const custom = ctx.db.getSetting("custom_emoji") || "none";
     const media = ctx.db.getSetting("media_type") || "none";
     const chat = ctx.db.getSetting("alert_chat_id");
     const mint = ctx.db.getSetting("token_mint") || "not set";
     const symbol = ctx.engine.symbol();
+    const buy = ctx.db.getSetting("buy_url");
+    const chart = ctx.db.getSetting("chart_url");
     return [
       "<b>Settings</b>",
       "",
-      `Min buy: ${escapeHtml(formatUiString(min))} ${escapeHtml(symbol)}`,
-      `Emoji: ${mode === "custom" ? `one symbol (${escapeHtml(custom)})` : "tiers"}`,
+      `Min buy: ${Number(min) > 0 ? `$${escapeHtml(min)}` : "every buy"}`,
+      `Emoji: ${mode === "custom" ? `one symbol (${escapeHtml(custom)})` : "tiers, one per $10"}`,
       tiersText(),
       `Media: ${escapeHtml(media)}`,
+      `Buy button: ${buy ? escapeHtml(buy) : "off"}`,
+      `Chart button: ${chart ? escapeHtml(chart) : "off"}`,
       `Alert chat: ${chat ? `<code>${escapeHtml(chat)}</code>` : "not set — add the bot to the group and send /setchat"}`,
       `Mint: <code>${escapeHtml(mint)}</code>`,
       `Symbol: ${escapeHtml(symbol)}`,
@@ -159,6 +169,10 @@ export function createTelegram(ctx) {
         { text: "Set mint", callback_data: "s:mint" },
         { text: "Set symbol", callback_data: "s:sym" },
       ],
+      [
+        { text: "Buy link", callback_data: "s:buy" },
+        { text: "Chart link", callback_data: "s:chart" },
+      ],
       [{ text: "Add operator", callback_data: "s:ops" }],
       [{ text: "Back", callback_data: "m:home" }],
     ]);
@@ -180,7 +194,7 @@ export function createTelegram(ctx) {
       `Eligible: ${eligible}`,
       `Disqualified: ${dq}`,
       "",
-      "A wallet enters when a buy leaves it at or above the entry amount. Selling or transferring under that line disqualifies it for good.",
+      "A wallet enters when its buys after the start add up to the entry amount. Tokens it already held do not count. Selling those new tokens back under the line disqualifies it.",
       "",
       "/stopcomp closes entries. /endcomp draws the winner list. /cancelcomp aborts.",
     ].join("\n");
@@ -260,6 +274,12 @@ export function createTelegram(ctx) {
     const mediaType = ctx.db.getSetting("media_type");
     const fileId = ctx.db.getSetting("media_file_id");
     const map = { photo: ["sendPhoto", "photo"], animation: ["sendAnimation", "animation"], video: ["sendVideo", "video"] };
+    const row = [];
+    const buy = validUrl(ctx.db.getSetting("buy_url"));
+    const chart = validUrl(ctx.db.getSetting("chart_url"));
+    if (buy) row.push({ text: "Buy", url: buy });
+    if (chart) row.push({ text: "Chart", url: chart });
+    const reply_markup = row.length ? { inline_keyboard: [row] } : undefined;
     if (mediaType && fileId && map[mediaType]) {
       const [method, field] = map[mediaType];
       return tg(method, {
@@ -267,9 +287,10 @@ export function createTelegram(ctx) {
         [field]: fileId,
         caption: text,
         parse_mode: "HTML",
+        reply_markup,
       });
     }
-    return sendText(chatId, text);
+    return sendText(chatId, text, reply_markup);
   }
 
   async function sendCard(chatId, text, mediaType, fileId) {
@@ -347,13 +368,13 @@ export function createTelegram(ctx) {
     if (data === "m:comp") return show(update, compText(), compKeyboard());
     if (data === "s:min") {
       ctx.db.setSession(fromId, "min");
-      return show(update, "Send the minimum buy in tokens. Examples: <code>1000000</code> or <code>1.5m</code>. Buys under it are ignored.", keyboard([[{ text: "Back", callback_data: "m:set" }]]));
+      return show(update, "Send the minimum buy in US dollars. Example: <code>10</code> or <code>25.50</code>. Buys under that are ignored. Send <code>0</code> to post every buy.", keyboard([[{ text: "Back", callback_data: "m:set" }]]));
     }
     if (data === "s:tiers") {
       ctx.db.setSession(fromId, "tier");
       return show(
         update,
-        `Current tiers:\n${tiersText()}\n\nSend one tier as <code>10000 🔥</code>. It replaces a tier with the same minimum, or adds one. Send <code>clear 10000</code> to remove that minimum.`,
+        `Current tiers:\n${tiersText()}\n\nTiers pick the emoji. The number is US dollars. One emoji is added for every $10. Send <code>50 🔥</code> to set a tier. Send <code>clear 50</code> to remove it.`,
         keyboard([[{ text: "Back", callback_data: "m:set" }]]),
       );
     }
@@ -375,6 +396,14 @@ export function createTelegram(ctx) {
       ctx.db.setSetting("media_file_id", "");
       return show(update, settingsText(), settingsKeyboard());
     }
+    if (data === "s:chart") {
+      ctx.db.setSession(fromId, "charturl");
+      return show(update, "Send the chart link, starting with https://. It becomes the Chart button on buy alerts. Send <code>off</code> to remove it.", keyboard([[{ text: "Back", callback_data: "m:set" }]]));
+    }
+    if (data === "s:buy") {
+      ctx.db.setSession(fromId, "buyurl");
+      return show(update, "Send the buy link, starting with https://. It becomes the Buy button on buy alerts. Send <code>off</code> to remove it.", keyboard([[{ text: "Back", callback_data: "m:set" }]]));
+    }
     if (data === "s:mint") {
       ctx.db.setSession(fromId, "mint");
       return show(update, "Send the token mint address.", keyboard([[{ text: "Back", callback_data: "m:set" }]]));
@@ -389,7 +418,7 @@ export function createTelegram(ctx) {
     }
     if (data === "c:start") {
       ctx.db.setSession(fromId, "comp_threshold", {});
-      return show(update, "Entry threshold in tokens. A wallet must hold at least this many after a buy. Example: <code>1000000</code>.", keyboard([[{ text: "Back", callback_data: "m:comp" }]]));
+      return show(update, "Entry threshold in tokens bought after the competition starts. Tokens already in the wallet do not count. Example: <code>1000000</code>.", keyboard([[{ text: "Back", callback_data: "m:comp" }]]));
     }
     if (data === "c:elig" || data === "c:dq") {
       const kind = data === "c:elig" ? "eligible" : "disqualified";
@@ -574,12 +603,30 @@ export function createTelegram(ctx) {
       return;
     }
     if (session.state === "min") {
-      const amount = parseTokenAmount(text);
-      if (!amount) {
-        await sendText(chat.id, "I could not read that amount. Try <code>250000</code> or <code>2.5m</code>.");
+      const amount = parseUsd(text);
+      if (amount == null) {
+        await sendText(chat.id, "Send a dollar amount like <code>10</code> or <code>25.50</code>.");
         return;
       }
-      ctx.db.setSetting("min_buy_ui", amount);
+      ctx.db.setSetting("min_buy_usd", amount);
+      ctx.db.clearSession(fromId);
+      await sendText(chat.id, settingsText(), settingsKeyboard());
+      return;
+    }
+    if (session.state === "buyurl" || session.state === "charturl") {
+      const key = session.state === "buyurl" ? "buy_url" : "chart_url";
+      if (/^off$/i.test(text)) {
+        ctx.db.setSetting(key, "");
+        ctx.db.clearSession(fromId);
+        await sendText(chat.id, settingsText(), settingsKeyboard());
+        return;
+      }
+      const url = validUrl(text);
+      if (!url) {
+        await sendText(chat.id, "Send a link that starts with https://, or <code>off</code>.");
+        return;
+      }
+      ctx.db.setSetting(key, url);
       ctx.db.clearSession(fromId);
       await sendText(chat.id, settingsText(), settingsKeyboard());
       return;

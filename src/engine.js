@@ -1,14 +1,15 @@
 import { wsUrl, createChain, syncHeliusWebhook } from "./chain.js";
-import { parseEnhancedTransaction, parseRawTransaction } from "./parse.js";
+import { parseEnhancedTransaction, parseRawTransaction, normalizeAmount, uiApproxRaw } from "./parse.js";
 import { createPrices } from "./prices.js";
 import { decideEntry } from "./rules.js";
 import {
   chunkText,
-  emojiForAmount,
+  emojiBar,
   escapeHtml,
   formatDuration,
   formatRaw,
   formatTimestamp,
+  formatTokenUi,
   formatUiString,
   formatUsd,
   shortAddress,
@@ -16,10 +17,15 @@ import {
 } from "./format.js";
 
 const DEFAULT_TIERS = [
+  { min: "10", emoji: "🟢" },
+  { min: "50", emoji: "🔥" },
+  { min: "100", emoji: "🐳" },
+];
+const OLD_TOKEN_TIERS = JSON.stringify([
   { min: "1000", emoji: "🟢" },
   { min: "10000", emoji: "🔥" },
   { min: "100000", emoji: "🐳" },
-];
+]);
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -101,92 +107,80 @@ export function createEngine(ctx) {
     });
   }
 
-  function renderAlert(buy, usd) {
-    const emoji = emojiForAmount(
-      buy.amountUi,
-      tiers(),
-      ctx.db.getSetting("emoji_mode") || "tiers",
-      ctx.db.getSetting("custom_emoji") || "",
-    );
-    const dec = buy.decimals || decimals() || 0;
-    const amount = formatRaw(buy.amountRaw, dec);
+  async function renderAlert(buy, usd, holdingUi) {
+    const bar = emojiBar(usd, tiers(), ctx.db.getSetting("emoji_mode") || "tiers", ctx.db.getSetting("custom_emoji") || "");
+    const amount = Number.isFinite(buy.amountUi) ? formatTokenUi(buy.amountUi) : formatRaw(buy.amountRaw, buy.decimals || decimals() || 0);
     const walletUrl = `https://solscan.io/account/${buy.wallet}`;
     const txUrl = `https://solscan.io/tx/${buy.signature}`;
-    return [
-      `${escapeHtml(emoji)} <b>BUY</b>`,
+    const lines = [
+      `${escapeHtml(bar)} <b>${escapeHtml(symbol())} BUY</b>`,
       "",
-      `Wallet: <a href="${walletUrl}">${escapeHtml(shortAddress(buy.wallet))}</a>`,
-      `Bought: <b>${escapeHtml(amount)}</b> ${escapeHtml(symbol())}`,
-      `Value: <b>${escapeHtml(formatUsd(usd))}</b>`,
-      `DEX: ${escapeHtml(buy.dex || "DEX")}`,
-      `Time: ${escapeHtml(formatTimestamp(buy.timestamp))}`,
+      `💰 <b>${escapeHtml(formatUsd(usd))}</b>`,
+      `🪙 <b>${escapeHtml(amount)}</b> ${escapeHtml(symbol())}`,
+      `👤 <a href="${walletUrl}">${escapeHtml(shortAddress(buy.wallet))}</a>`,
+    ];
+    if (holdingUi != null) lines.push(`💼 <b>${escapeHtml(formatTokenUi(holdingUi))}</b> held now`);
+    lines.push(
+      `🏪 ${escapeHtml(buy.dex || "DEX")}`,
+      `🕒 ${escapeHtml(formatTimestamp(buy.timestamp))}`,
       "",
-      `<a href="${txUrl}">View transaction</a>`,
-    ].join("\n");
+      `🔗 <a href="${txUrl}">View transaction</a>`,
+    );
+    return lines.join("\n");
   }
 
-  function meetsMinimum(buy) {
-    const minUi = ctx.db.getSetting("min_buy_ui") || "0";
-    const dec = buy.decimals ?? decimals();
-    if (dec == null) return buy.amountUi + 1e-12 >= Number(minUi);
-    try {
-      return BigInt(buy.amountRaw) >= uiStringToRaw(minUi, dec);
-    } catch {
-      return buy.amountUi + 1e-12 >= Number(minUi);
-    }
+  function underMinimum(usd) {
+    const min = Number(ctx.db.getSetting("min_buy_usd") || "0");
+    if (!(min > 0)) return false;
+    if (usd == null || !Number.isFinite(usd)) return false;
+    return usd + 1e-9 < min;
   }
 
   async function applyEffectsClean(parsed) {
     const comp = ctx.db.activeCompetition();
-    const sizeByWallet = new Map();
-    for (const buy of parsed.buys) sizeByWallet.set(buy.wallet, BigInt(buy.amountRaw));
+    const buys = new Map();
+    for (const buy of parsed.buys) buys.set(buy.wallet, BigInt(buy.amountRaw));
     if (!comp) {
-      for (const [wallet, raw] of sizeByWallet) ctx.db.recordBuy(parsed.signature, wallet, raw.toString());
+      for (const [wallet, raw] of buys) ctx.db.recordBuy(parsed.signature, wallet, raw.toString());
       return [];
     }
-    const wallets = new Set([...sizeByWallet.keys()]);
-    for (const change of parsed.changes) {
-      if (ctx.db.competitor(comp.id, change.wallet)) wallets.add(change.wallet);
+    const sells = new Map();
+    const dec = comp.decimals;
+    for (const change of parsed.changes || []) {
+      if (!(change.deltaUi < 0)) continue;
+      if (!ctx.db.competitor(comp.id, change.wallet) && !buys.has(change.wallet)) continue;
+      sells.set(change.wallet, BigInt(uiApproxRaw(Math.abs(change.deltaUi), dec)));
     }
+    const wallets = new Set([...buys.keys(), ...sells.keys()]);
     const notes = [];
     for (const wallet of wallets) {
-      const qualifyRaw = sizeByWallet.get(wallet) || 0n;
-      const already = qualifyRaw > 0n && ctx.db.hasBuy(parsed.signature, wallet);
-      const note = await settleWallet(comp, wallet, {
-        countRaw: already ? 0n : qualifyRaw,
-        qualifies: qualifyRaw > 0n,
-        qualifyRaw,
+      const buyRaw = buys.get(wallet) || 0n;
+      const already = buyRaw > 0n && ctx.db.hasBuy(parsed.signature, wallet);
+      const note = settleWallet(comp, wallet, {
+        buyRaw: already ? 0n : buyRaw,
+        sellRaw: sells.get(wallet) || 0n,
       });
-      if (qualifyRaw > 0n) ctx.db.recordBuy(parsed.signature, wallet, qualifyRaw.toString());
+      if (buyRaw > 0n) ctx.db.recordBuy(parsed.signature, wallet, buyRaw.toString());
       notes.push({ wallet, ...note });
     }
     return notes;
   }
 
-  async function settleWallet(comp, wallet, { countRaw, qualifies, qualifyRaw }) {
-    let bal;
-    try {
-      bal = await chain.balanceRaw(wallet, mint());
-    } catch (err) {
-      ctx.log.error("balance refresh failed; not disqualifying", { wallet, err });
-      if (!qualifies) {
-        balanceRetries.add(JSON.stringify({ competitionId: comp.id, wallet }));
-        return { entered: false, disqualified: false };
-      }
-      throw err;
-    }
+  function settleWallet(comp, wallet, { buyRaw, sellRaw }) {
     const existing = ctx.db.competitor(comp.id, wallet);
+    if (!existing && buyRaw <= 0n) return { entered: false, disqualified: false };
     const previous =
       existing?.status === "eligible" || existing?.status === "disqualified" ? existing.status : "watching";
+    const bought = BigInt(existing?.total_bought_raw || "0") + buyRaw;
+    const sold = BigInt(existing?.sold_raw || "0") + sellRaw;
+    const position = bought > sold ? bought - sold : 0n;
     const next = decideEntry({
       status: previous,
-      balanceRaw: bal.raw,
+      positionRaw: position,
       thresholdRaw: BigInt(comp.threshold_raw),
-      buyRaw: qualifies ? qualifyRaw : 0n,
       entriesOpen: comp.status === "active",
     });
-    if (next === "watching" && !existing) return { entered: false, disqualified: false };
-    const total = BigInt(existing?.total_bought_raw || "0") + countRaw;
+    if (next === "watching" && bought === 0n) return { entered: false, disqualified: false };
     let enteredAt = existing?.entered_at ?? null;
     let disqualifiedAt = existing?.disqualified_at ?? null;
     const entered = next === "eligible" && previous !== "eligible";
@@ -200,12 +194,13 @@ export function createEngine(ctx) {
       competitionId: comp.id,
       wallet,
       enteredAt,
-      totalBoughtRaw: total.toString(),
-      balanceRaw: bal.raw.toString(),
-      status: next === "watching" ? previous : next,
+      totalBoughtRaw: bought.toString(),
+      balanceRaw: position.toString(),
+      soldRaw: sold.toString(),
+      status: next,
       disqualifiedAt,
     });
-    return { entered, disqualified, balanceRaw: bal.raw, totalRaw: total };
+    return { entered, disqualified, positionRaw: position, boughtRaw: bought };
   }
 
   async function notify(text) {
@@ -253,7 +248,15 @@ export function createEngine(ctx) {
     } catch (err) {
       ctx.log.warn("price failed", { err });
     }
-    const text = renderAlert(buy, usd);
+    let holdingUi = null;
+    try {
+      const bal = await chain.balanceRaw(buy.wallet, mint());
+      const dec = bal.decimals ?? buy.decimals ?? decimals() ?? 0;
+      holdingUi = Number(bal.raw) / 10 ** dec;
+    } catch (err) {
+      ctx.log.warn("holding balance failed", { wallet: buy.wallet, err });
+    }
+    const text = await renderAlert(buy, usd, holdingUi);
     try {
       const message = await ctx.telegram.sendAlert(chatId, text);
       ctx.db.recordAlert({
@@ -297,18 +300,31 @@ export function createEngine(ctx) {
   }
 
   async function queueAlerts(parsed) {
-    const qualifying = parsed.buys.filter(meetsMinimum);
-    const ignored = parsed.buys.length - qualifying.length;
+    const accepted = [];
+    let ignored = 0;
+    for (const buy of parsed.buys) {
+      let usd = null;
+      try {
+        usd = await priceOf(buy);
+      } catch (err) {
+        ctx.log.warn("price failed", { err });
+      }
+      if (underMinimum(usd)) {
+        ignored += 1;
+        continue;
+      }
+      accepted.push({ ...buy, usd });
+    }
     if (ignored > 0) {
       ctx.log.info("buys under minimum ignored", { signature: parsed.signature, ignored });
     }
-    if (!qualifying.length) {
+    if (!accepted.length) {
       if (!ctx.db.pendingOutbox(1).some((row) => row.signature === parsed.signature)) {
         ctx.db.setAlertFlag(parsed.signature, "skip");
       }
       return;
     }
-    for (const buy of qualifying) {
+    for (const buy of accepted) {
       ctx.db.enqueueAlert(parsed.signature, buy.wallet, buy);
     }
     ctx.db.setAlertFlag(parsed.signature, "pending");
@@ -325,6 +341,8 @@ export function createEngine(ctx) {
     try {
       let notes = [];
       if (!ctx.db.seen(parsed.signature)?.effects) {
+        await ensureMeta();
+        parsed.buys = (parsed.buys || []).map((buy) => normalizeAmount(buy, decimals()));
         notes = await applyEffectsClean(parsed);
         ctx.db.markEffects(parsed.signature);
       }
@@ -333,7 +351,7 @@ export function createEngine(ctx) {
       for (const note of notes) {
         if (note.entered) {
           const comp = ctx.db.activeCompetition();
-          if (comp) await announceEntry(note.wallet, comp, note.balanceRaw);
+          if (comp) await announceEntry(note.wallet, comp, note.positionRaw);
         } else if (note.disqualified) {
           await announceDisqualified(note.wallet);
         }
@@ -522,20 +540,7 @@ export function createEngine(ctx) {
   }
 
   async function refreshCompetitors() {
-    const comp = ctx.db.activeCompetition();
-    if (!comp) return;
-    const rows = ctx.db.competitors(comp.id, "eligible");
-    for (const row of rows) {
-      try {
-        const note = await settleWallet(comp, row.wallet, { countRaw: 0n, qualifies: false, qualifyRaw: 0n });
-        if (note.disqualified) {
-          ctx.log.info("competition disqualified on refresh", { wallet: row.wallet });
-          await announceDisqualified(row.wallet);
-        }
-      } catch (err) {
-        ctx.log.error("competitor refresh failed", { wallet: row.wallet, err });
-      }
-    }
+    return;
   }
 
   async function drainBalanceRetries() {
@@ -546,7 +551,7 @@ export function createEngine(ctx) {
         const { competitionId, wallet } = JSON.parse(job);
         const comp = ctx.db.competition(competitionId);
         if (!comp || (comp.status !== "active" && comp.status !== "holding")) continue;
-        const note = await settleWallet(comp, wallet, { countRaw: 0n, qualifies: false, qualifyRaw: 0n });
+        const note = settleWallet(comp, wallet, { buyRaw: 0n, sellRaw: 0n });
         if (note.disqualified) await announceDisqualified(wallet);
       } catch (err) {
         ctx.log.error("deferred balance refresh failed", { err });
@@ -572,7 +577,7 @@ export function createEngine(ctx) {
       lines.push(
         `${index + 1}. <code>${escapeHtml(row.wallet)}</code>`,
         `Bought: ${escapeHtml(formatRaw(row.total_bought_raw, comp.decimals))} ${escapeHtml(symbol())}`,
-        `Balance: ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))} ${escapeHtml(symbol())}`,
+        `Still in comp: ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))} ${escapeHtml(symbol())}`,
         `Held above threshold: ${formatDuration(held)}`,
         "",
       );
@@ -665,16 +670,16 @@ export function createEngine(ctx) {
     );
   }
 
-  async function announceEntry(wallet, comp, balanceRaw) {
+  async function announceEntry(wallet, comp, positionRaw) {
     const left = Math.max(0, comp.ends_at - Date.now());
     const url = `https://solscan.io/account/${wallet}`;
-    const balance = balanceRaw == null ? "n/a" : formatRaw(balanceRaw, comp.decimals);
+    const bought = positionRaw == null ? "n/a" : formatTokenUi(Number(positionRaw) / 10 ** comp.decimals);
     await postToGroup(
       [
         "🔥 <b>NEW ENTRY</b>",
         "",
         `<a href="${url}">${escapeHtml(shortAddress(wallet))}</a>`,
-        `Balance: <b>${escapeHtml(balance)}</b> ${escapeHtml(symbol())}`,
+        `Bought since start: <b>${escapeHtml(bought)}</b> ${escapeHtml(symbol())}`,
         `Eligible in ${formatDuration(left)}`,
       ].join("\n"),
     );
@@ -703,7 +708,7 @@ export function createEngine(ctx) {
       const url = `https://solscan.io/account/${row.wallet}`;
       lines.push(
         `${index + 1}. <a href="${url}">${escapeHtml(shortAddress(row.wallet))}</a>`,
-        `Balance ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))} ${escapeHtml(symbol())}`,
+        `In the comp ${escapeHtml(formatTokenUi(Number(row.balance_raw) / 10 ** comp.decimals))} ${escapeHtml(symbol())}`,
         closed ? "Still holding" : `Eligible in ${left}`,
         "",
       );
@@ -777,7 +782,7 @@ export function createEngine(ctx) {
       const held = row.entered_at ? formatDuration(Date.now() - row.entered_at) : "n/a";
       return [
         `<code>${escapeHtml(row.wallet)}</code>`,
-        `Bought ${escapeHtml(formatRaw(row.total_bought_raw, comp.decimals))} · Balance ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))}`,
+        `Bought ${escapeHtml(formatRaw(row.total_bought_raw, comp.decimals))} · Still in comp ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))}`,
         kind === "eligible" ? `Held ${held}` : `Out ${row.disqualified_at ? formatTimestamp(Math.floor(row.disqualified_at / 1000)) : ""}`,
       ].join("\n");
     });
@@ -787,7 +792,9 @@ export function createEngine(ctx) {
   function start() {
     running = true;
     ctx.db.resetStuck();
-    if (!ctx.db.getSetting("emoji_tiers")) ctx.db.setSetting("emoji_tiers", JSON.stringify(DEFAULT_TIERS));
+    if (!ctx.db.getSetting("emoji_tiers") || ctx.db.getSetting("emoji_tiers") === OLD_TOKEN_TIERS) {
+      ctx.db.setSetting("emoji_tiers", JSON.stringify(DEFAULT_TIERS));
+    }
     if (!ctx.db.getSetting("emoji_mode")) ctx.db.setSetting("emoji_mode", "tiers");
     if (!ctx.db.getSetting("min_buy_ui")) ctx.db.setSetting("min_buy_ui", ctx.config.minBuy || "0");
     if (!ctx.db.getSetting("token_mint") && ctx.config.mint) ctx.db.setSetting("token_mint", ctx.config.mint);

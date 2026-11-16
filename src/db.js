@@ -80,6 +80,10 @@ export function openDatabase(filePath) {
       db.exec(`ALTER TABLE competitions ADD COLUMN ${name} ${type}`);
     }
   }
+  const competitorCols = db.prepare("PRAGMA table_info(competitors)").all();
+  if (!competitorCols.some((col) => col.name === "sold_raw")) {
+    db.exec("ALTER TABLE competitors ADD COLUMN sold_raw TEXT NOT NULL DEFAULT '0'");
+  }
 
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
   const setSettingStmt = db.prepare(
@@ -228,12 +232,13 @@ export function openDatabase(filePath) {
     },
     upsertCompetitor(row) {
       db.prepare(
-        `INSERT INTO competitors(competition_id, wallet, entered_at, total_bought_raw, balance_raw, status, disqualified_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO competitors(competition_id, wallet, entered_at, total_bought_raw, balance_raw, sold_raw, status, disqualified_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(competition_id, wallet) DO UPDATE SET
            entered_at = excluded.entered_at,
            total_bought_raw = excluded.total_bought_raw,
            balance_raw = excluded.balance_raw,
+           sold_raw = excluded.sold_raw,
            status = excluded.status,
            disqualified_at = excluded.disqualified_at`,
       ).run(
@@ -242,6 +247,7 @@ export function openDatabase(filePath) {
         row.enteredAt,
         row.totalBoughtRaw,
         row.balanceRaw,
+        row.soldRaw || "0",
         row.status,
         row.disqualifiedAt,
       );

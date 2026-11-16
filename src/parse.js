@@ -247,13 +247,37 @@ export function parseEnhancedTransaction(tx, mint) {
   };
 }
 
-function uiApproxRaw(ui, decimals) {
+export function uiApproxRaw(ui, decimals) {
   const negative = ui < 0;
   const abs = Math.abs(ui);
   const [whole, frac = ""] = abs.toFixed(Math.min(decimals, 9)).split(".");
   const fracPadded = frac.padEnd(decimals, "0").slice(0, decimals);
   const raw = BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fracPadded || "0");
   return (negative ? -raw : raw).toString();
+}
+
+/** Helius sometimes gives the human amount with decimals omitted. Scale it once. */
+export function normalizeAmount(buy, mintDecimals) {
+  const ui = Number(buy.amountUi);
+  const dec = Number(buy.decimals) > 0 ? Number(buy.decimals) : Number(mintDecimals);
+  if (!Number.isInteger(dec) || dec < 0 || !Number.isFinite(ui) || ui <= 0) {
+    return { ...buy, decimals: Number.isInteger(dec) ? dec : 0 };
+  }
+  let raw = 0n;
+  try {
+    raw = BigInt(buy.amountRaw);
+  } catch {
+    raw = 0n;
+  }
+  const scaled = BigInt(uiApproxRaw(ui, dec));
+  const rawNumber = Number(raw);
+  const tooSmall = !Number.isFinite(rawNumber) || rawNumber < (ui * 10 ** dec) / 100;
+  return {
+    ...buy,
+    amountRaw: (tooSmall ? scaled : raw).toString(),
+    decimals: dec,
+    amountUi: ui,
+  };
 }
 
 function balancesByOwner(rows, mint) {

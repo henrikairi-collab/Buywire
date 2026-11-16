@@ -59,6 +59,26 @@ export function formatRaw(raw, decimals) {
   return neg ? `-${body}` : body;
 }
 
+export function formatTokenUi(ui) {
+  const n = Number(ui);
+  if (!Number.isFinite(n)) return String(ui);
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+  const trim = (value) => value.toFixed(2).replace(/\.00$/, "").replace(/(\.\d)0$/, "$1");
+  if (abs >= 1e9) return `${sign}${trim(abs / 1e9)}B`;
+  if (abs >= 1e6) return `${sign}${trim(abs / 1e6)}M`;
+  if (abs >= 1e3) return `${sign}${trim(abs / 1e3)}K`;
+  return `${sign}${abs.toLocaleString("en-US", { maximumFractionDigits: 2 })}`;
+}
+
+export function parseUsd(input) {
+  const s = String(input).trim().replace(/[$,\s]/g, "");
+  if (!/^\d+(\.\d{1,2})?$/.test(s)) return null;
+  const n = Number(s);
+  if (!Number.isFinite(n) || n < 0 || n > 1_000_000_000) return null;
+  return s.replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+}
+
 export function formatUiString(ui) {
   const parsed = parseTokenAmount(ui);
   if (!parsed) return String(ui);
@@ -105,9 +125,9 @@ export function formatTimestamp(unixSeconds) {
 
 export function escapeHtml(value) {
   return String(value)
-    .replace(/&/g, "&")
-    .replace(/</g, "<")
-    .replace(/>/g, ">");
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 export function isMintAddress(value) {
@@ -130,6 +150,12 @@ export function emojiForAmount(amountUi, tiers, mode, customEmoji) {
     if (amountUi + 1e-12 >= Number(tier.min) && tier.emoji) return tier.emoji;
   }
   return "●";
+}
+
+export function emojiBar(usd, tiers, mode, customEmoji) {
+  const glyph = emojiForAmount(usd, tiers, mode, customEmoji);
+  const count = Number.isFinite(usd) && usd > 0 ? Math.min(15, Math.max(1, Math.floor(usd / 10))) : 1;
+  return glyph.repeat(count);
 }
 
 export function chunkText(text, size = 3500) {
