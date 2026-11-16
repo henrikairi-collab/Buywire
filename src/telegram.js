@@ -199,13 +199,13 @@ export function createTelegram(ctx) {
       "<b>Buy comp</b>",
       "",
       `Prize: ${escapeHtml(comp.prize_text)}`,
-      `Entry: ${escapeHtml(formatUiString(comp.threshold_ui))} ${escapeHtml(ctx.engine.symbol())}`,
+      `Entry: $${escapeHtml(formatUiString(comp.threshold_ui))}`,
       `Hold: ${comp.duration_days} day(s)`,
       comp.status === "holding" ? "Entries: closed. Hold is still being watched." : `Time left: ${left}`,
       `Eligible: ${eligible}`,
       `Disqualified: ${dq}`,
       "",
-      "A wallet enters when its buys after the start add up to the entry amount. Tokens it already held do not count. Selling those new tokens back under the line disqualifies it.",
+      "A wallet enters when tokens bought after the start are worth at least the dollar entry. Tokens it already held do not count. Selling those new tokens back under the dollar line disqualifies it.",
       "",
       "/stopcomp closes entries. /endcomp draws the winner list. /cancelcomp aborts.",
     ].join("\n");
@@ -274,6 +274,29 @@ export function createTelegram(ctx) {
         return `$${tier.min}+ adds ${tier.bonus} · a $${tier.min} buy earns ${sample.total}`;
       })
       .join("\n");
+  }
+
+  function lotteryConfirmText(draft) {
+    const card = draft.mediaType ? draft.mediaType : "none";
+    return [
+      "<b>Start this lottery?</b>",
+      `Ticket: $${escapeHtml(String(draft.ticketUsd))}`,
+      `Length: ${draft.durationDays} day(s)`,
+      `Prize: ${escapeHtml(draft.prize)}`,
+      lotteryTierPreview(draft.ticketUsd, draft.tiers || []),
+      `Card: ${escapeHtml(card)}`,
+      "",
+      "Only buys after the start count. Any sell burns that wallet's tickets.",
+    ].join("\n");
+  }
+
+  function lotteryConfirmKeyboard() {
+    return keyboard([
+      [
+        { text: "Start", callback_data: "lx:yes" },
+        { text: "Cancel", callback_data: "lx:no" },
+      ],
+    ]);
   }
 
   function statusText() {
@@ -382,7 +405,7 @@ export function createTelegram(ctx) {
     const card = draft.mediaType ? draft.mediaType : "none";
     return [
       "<b>Start this competition?</b>",
-      `Entry: ${escapeHtml(formatUiString(draft.thresholdUi))} ${escapeHtml(ctx.engine.symbol())}`,
+      `Entry: $${escapeHtml(formatUiString(draft.thresholdUsd || draft.thresholdUi || "0"))}`,
       `Hold: ${draft.durationDays} day(s)`,
       `Prize: ${escapeHtml(draft.prize)}`,
       `Card: ${escapeHtml(card)}`,
@@ -489,7 +512,7 @@ export function createTelegram(ctx) {
     }
     if (data === "c:start") {
       ctx.db.setSession(fromId, "comp_threshold", {});
-      return show(update, "Entry threshold in tokens bought after the competition starts. Tokens already in the wallet do not count. Example: <code>1000000</code>.", keyboard([[{ text: "Back", callback_data: "m:comp" }]]));
+      return show(update, "Entry in US dollars of tokens bought after the start. Example: <code>20</code> means every wallet that buys at least $20 and holds it.", keyboard([[{ text: "Back", callback_data: "m:comp" }]]));
     }
     if (data === "c:elig" || data === "c:dq") {
       const kind = data === "c:elig" ? "eligible" : "disqualified";
@@ -542,7 +565,7 @@ export function createTelegram(ctx) {
       const draft = ctx.db.session(fromId).data || {};
       try {
         const comp = await ctx.engine.startCompetition({
-          thresholdUi: draft.thresholdUi,
+          thresholdUsd: draft.thresholdUsd || draft.thresholdUi,
           durationDays: draft.durationDays,
           prize: draft.prize,
           mediaType: draft.mediaType || "",
@@ -605,6 +628,13 @@ export function createTelegram(ctx) {
       ctx.db.setSession(fromId, "lot_prize", draft);
       return show(update, "Prize text. Example: <code>$25 of SOL</code>. This is a label, not a payment.", keyboard([[{ text: "Back", callback_data: "m:lot" }]]));
     }
+    if (data === "l:skipmedia") {
+      const draft = { ...(ctx.db.session(fromId).data || {}) };
+      delete draft.mediaType;
+      delete draft.mediaFileId;
+      ctx.db.setSession(fromId, "lot_confirm", draft);
+      return show(update, lotteryConfirmText(draft), lotteryConfirmKeyboard());
+    }
     if (data === "lx:yes") {
       const draft = ctx.db.session(fromId).data || {};
       try {
@@ -613,6 +643,8 @@ export function createTelegram(ctx) {
           durationDays: draft.durationDays,
           prize: draft.prize,
           tiers: draft.tiers || [],
+          mediaType: draft.mediaType || "",
+          mediaFileId: draft.mediaFileId || "",
         });
         ctx.db.clearSession(fromId);
         return show(update, `Trench Lottery #${lot.id} is live. Only buys from now on count. Any sell burns that wallet.`, lotteryKeyboard());
@@ -936,37 +968,28 @@ export function createTelegram(ctx) {
         return;
       }
       const draft = { ...(session.data || {}), prize: text };
-      ctx.db.setSession(fromId, "lot_confirm", draft);
+      ctx.db.setSession(fromId, "lot_media", draft);
       await sendText(
         chat.id,
-        [
-          "<b>Start this lottery?</b>",
-          `Ticket: $${escapeHtml(String(draft.ticketUsd))}`,
-          `Length: ${draft.durationDays} day(s)`,
-          `Prize: ${escapeHtml(draft.prize)}`,
-          lotteryTierPreview(draft.ticketUsd, draft.tiers || []),
-          "",
-          "Only buys after the start count. Any sell burns that wallet's tickets.",
-        ].join("\n"),
-        keyboard([
-          [
-            { text: "Start", callback_data: "lx:yes" },
-            { text: "Cancel", callback_data: "lx:no" },
-          ],
-        ]),
+        "Send a photo, GIF, or video for the lottery announcement in the group.",
+        keyboard([[{ text: "Skip media", callback_data: "l:skipmedia" }]]),
       );
       return;
     }
+    if (session.state === "lot_media") {
+      await sendText(chat.id, "Send a photo, GIF, or video, or tap Skip media.");
+      return;
+    }
     if (session.state === "comp_threshold") {
-      const amount = parseTokenAmount(text);
-      if (!amount) {
-        await sendText(chat.id, "Try <code>1000000</code> or <code>1m</code>.");
+      const amount = parseUsd(text);
+      if (!amount || Number(amount) <= 0) {
+        await sendText(chat.id, "Send a dollar amount like <code>20</code>.");
         return;
       }
-      ctx.db.setSession(fromId, "comp_duration", { thresholdUi: amount });
+      ctx.db.setSession(fromId, "comp_duration", { thresholdUsd: amount });
       await sendText(
         chat.id,
-        "How long does a wallet have to stay above that balance?",
+        "How long do they have to hold those tokens?",
         keyboard([
           [
             { text: "1 day", callback_data: "d:1" },
@@ -1032,6 +1055,12 @@ export function createTelegram(ctx) {
       const draft = { ...(session.data || {}), mediaType: type, mediaFileId: fileId };
       ctx.db.setSession(message.from.id, "comp_confirm", draft);
       await sendText(message.chat.id, confirmText(draft), confirmKeyboard());
+      return;
+    }
+    if (session.state === "lot_media") {
+      const draft = { ...(session.data || {}), mediaType: type, mediaFileId: fileId };
+      ctx.db.setSession(message.from.id, "lot_confirm", draft);
+      await sendText(message.chat.id, lotteryConfirmText(draft), lotteryConfirmKeyboard());
       return;
     }
     if (session.state !== "media") return;

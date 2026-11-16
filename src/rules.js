@@ -8,11 +8,11 @@
  */
 
 /**
- * A wallet enters on tokens bought after the competition started, not on the
- * bag it already held. Selling those tokens back under the line is final.
+ * A wallet enters on the dollar value of tokens bought after the competition
+ * started, priced at the time of each buy. Selling those tokens reduces that
+ * credit. Dropping under the dollar line is final.
  *
  * @param {{ status?: string, positionRaw: bigint, thresholdRaw: bigint, entriesOpen?: boolean }} input
- * @returns {"watching" | "eligible" | "disqualified"}
  */
 export function decideEntry({ status, positionRaw, thresholdRaw, entriesOpen = true }) {
   const current = status || "watching";
@@ -23,6 +23,15 @@ export function decideEntry({ status, positionRaw, thresholdRaw, entriesOpen = t
   if (!entriesOpen) return "watching";
   if (positionRaw >= thresholdRaw) return "eligible";
   return "watching";
+}
+
+export function remainingCredit(grossCents, boughtRaw, positionRaw) {
+  const gross = BigInt(grossCents || 0);
+  const bought = BigInt(boughtRaw || 0);
+  const position = BigInt(positionRaw || 0);
+  if (gross <= 0n || bought <= 0n || position <= 0n) return 0n;
+  const held = position > bought ? bought : position;
+  return (gross * held) / bought;
 }
 
 export function shouldAlert(amountRaw, minRaw) {

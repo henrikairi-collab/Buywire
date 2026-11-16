@@ -49,6 +49,7 @@ CREATE TABLE IF NOT EXISTS competitors (
   balance_raw TEXT NOT NULL DEFAULT '0',
   status TEXT NOT NULL,
   disqualified_at INTEGER,
+  usd_cents TEXT NOT NULL DEFAULT '0',
   PRIMARY KEY (competition_id, wallet)
 );
 CREATE TABLE IF NOT EXISTS sessions (
@@ -81,7 +82,9 @@ CREATE TABLE IF NOT EXISTS lotteries (
   winner TEXT,
   draw_chat_id TEXT,
   draw_message_id INTEGER,
-  draw_started_at INTEGER
+  draw_started_at INTEGER,
+  media_type TEXT,
+  media_file_id TEXT
 );
 CREATE TABLE IF NOT EXISTS lottery_wallets (
   lottery_id INTEGER NOT NULL,
@@ -115,6 +118,15 @@ export function openDatabase(filePath) {
   const competitorCols = db.prepare("PRAGMA table_info(competitors)").all();
   if (!competitorCols.some((col) => col.name === "sold_raw")) {
     db.exec("ALTER TABLE competitors ADD COLUMN sold_raw TEXT NOT NULL DEFAULT '0'");
+  }
+  if (!competitorCols.some((col) => col.name === "usd_cents")) {
+    db.exec("ALTER TABLE competitors ADD COLUMN usd_cents TEXT NOT NULL DEFAULT '0'");
+  }
+  const lotteryCols = db.prepare("PRAGMA table_info(lotteries)").all();
+  for (const name of ["media_type", "media_file_id"]) {
+    if (!lotteryCols.some((col) => col.name === name)) {
+      db.exec(`ALTER TABLE lotteries ADD COLUMN ${name} TEXT`);
+    }
   }
 
   const getSettingStmt = db.prepare("SELECT value FROM settings WHERE key = ?");
@@ -264,13 +276,14 @@ export function openDatabase(filePath) {
     },
     upsertCompetitor(row) {
       db.prepare(
-        `INSERT INTO competitors(competition_id, wallet, entered_at, total_bought_raw, balance_raw, sold_raw, status, disqualified_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO competitors(competition_id, wallet, entered_at, total_bought_raw, balance_raw, sold_raw, usd_cents, status, disqualified_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(competition_id, wallet) DO UPDATE SET
            entered_at = excluded.entered_at,
            total_bought_raw = excluded.total_bought_raw,
            balance_raw = excluded.balance_raw,
            sold_raw = excluded.sold_raw,
+           usd_cents = excluded.usd_cents,
            status = excluded.status,
            disqualified_at = excluded.disqualified_at`,
       ).run(
@@ -280,6 +293,7 @@ export function openDatabase(filePath) {
         row.totalBoughtRaw,
         row.balanceRaw,
         row.soldRaw || "0",
+        row.usdCents || "0",
         row.status,
         row.disqualifiedAt,
       );
@@ -335,10 +349,20 @@ export function openDatabase(filePath) {
     createLottery(row) {
       const result = db
         .prepare(
-          `INSERT INTO lotteries(ticket_usd, tiers_json, duration_days, prize_text, decimals, started_at, ends_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'active')`,
+          `INSERT INTO lotteries(ticket_usd, tiers_json, duration_days, prize_text, decimals, started_at, ends_at, status, media_type, media_file_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
         )
-        .run(row.ticketUsd, row.tiersJson, row.durationDays, row.prizeText, row.decimals, row.startedAt, row.endsAt);
+        .run(
+          row.ticketUsd,
+          row.tiersJson,
+          row.durationDays,
+          row.prizeText,
+          row.decimals,
+          row.startedAt,
+          row.endsAt,
+          row.mediaType || null,
+          row.mediaFileId || null,
+        );
       return Number(result.lastInsertRowid);
     },
     setLotteryStatus(id, status) {

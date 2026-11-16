@@ -1,7 +1,7 @@
 import { wsUrl, createChain, syncHeliusWebhook } from "./chain.js";
 import { parseEnhancedTransaction, parseRawTransaction, normalizeAmount, uiApproxRaw } from "./parse.js";
 import { createPrices } from "./prices.js";
-import { decideEntry } from "./rules.js";
+import { decideEntry, remainingCredit } from "./rules.js";
 import { DRAW_MS, pickWinner, renderLeaderboard, renderSpin, spinCursor, ticketsForBuy } from "./lottery.js";
 import {
   chunkText,
@@ -143,7 +143,13 @@ export function createEngine(ctx) {
     for (const buy of parsed.buys) buys.set(buy.wallet, BigInt(buy.amountRaw));
     if (!comp) {
       for (const [wallet, raw] of buys) ctx.db.recordBuy(parsed.signature, wallet, raw.toString());
-      return [];
+      return applyLottery(parsed);
+    }
+    if (comp) {
+      for (const buy of parsed.buys) {
+        if (buy.usd == null) buy.usd = await priceOf(buy);
+        if (buy.usd == null) throw new Error("token price unavailable");
+      }
     }
     const sells = new Map();
     const dec = comp.decimals;
@@ -156,10 +162,13 @@ export function createEngine(ctx) {
     const notes = [];
     for (const wallet of wallets) {
       const buyRaw = buys.get(wallet) || 0n;
+      const buy = (parsed.buys || []).find((row) => row.wallet === wallet);
       const already = buyRaw > 0n && ctx.db.hasBuy(parsed.signature, wallet);
+      const buyUsdCents = !already && buyRaw > 0n ? BigInt(Math.round(Number(buy?.usd || 0) * 100)) : 0n;
       const note = settleWallet(comp, wallet, {
         buyRaw: already ? 0n : buyRaw,
         sellRaw: sells.get(wallet) || 0n,
+        buyUsdCents,
       });
       if (buyRaw > 0n) ctx.db.recordBuy(parsed.signature, wallet, buyRaw.toString());
       notes.push({ wallet, ...note });
@@ -168,7 +177,7 @@ export function createEngine(ctx) {
     return [...notes, ...lotteryNotes];
   }
 
-  function settleWallet(comp, wallet, { buyRaw, sellRaw }) {
+  function settleWallet(comp, wallet, { buyRaw, sellRaw, buyUsdCents = 0n }) {
     const existing = ctx.db.competitor(comp.id, wallet);
     if (!existing && buyRaw <= 0n) return { entered: false, disqualified: false };
     const previous =
@@ -176,9 +185,11 @@ export function createEngine(ctx) {
     const bought = BigInt(existing?.total_bought_raw || "0") + buyRaw;
     const sold = BigInt(existing?.sold_raw || "0") + sellRaw;
     const position = bought > sold ? bought - sold : 0n;
+    const gross = BigInt(existing?.usd_cents || "0") + buyUsdCents;
+    const credited = remainingCredit(gross, bought, position);
     const next = decideEntry({
       status: previous,
-      positionRaw: position,
+      positionRaw: credited,
       thresholdRaw: BigInt(comp.threshold_raw),
       entriesOpen: comp.status === "active",
     });
@@ -199,10 +210,11 @@ export function createEngine(ctx) {
       totalBoughtRaw: bought.toString(),
       balanceRaw: position.toString(),
       soldRaw: sold.toString(),
+      usdCents: gross.toString(),
       status: next,
       disqualifiedAt,
     });
-    return { entered, disqualified, positionRaw: position, boughtRaw: bought };
+    return { entered, disqualified, positionRaw: position, creditedCents: credited, boughtRaw: bought };
   }
 
   async function applyLottery(parsed) {
@@ -233,7 +245,7 @@ export function createEngine(ctx) {
         continue;
       }
       if (ctx.db.lotteryBuySeen(lot.id, parsed.signature, buy.wallet)) continue;
-      const usd = await priceOf(buy);
+      const usd = buy.usd ?? (await priceOf(buy));
       if (usd == null) throw new Error("token price unavailable for lottery tickets");
       const math = ticketsForBuy(usd, lot.ticket_usd, tiers);
       if (math.total <= 0) {
@@ -406,7 +418,7 @@ export function createEngine(ctx) {
           await announceLotteryOut(note);
         } else if (note.entered) {
           const comp = ctx.db.activeCompetition();
-          if (comp) await announceEntry(note.wallet, comp, note.positionRaw);
+          if (comp) await announceEntry(note.wallet, comp, note.creditedCents);
         } else if (note.disqualified) {
           await announceDisqualified(note.wallet);
         }
@@ -621,7 +633,7 @@ export function createEngine(ctx) {
     const lines = [
       `<b>${heading}</b>`,
       `Prize: ${escapeHtml(comp.prize_text)}`,
-      `Threshold: ${escapeHtml(formatUiString(comp.threshold_ui))} ${escapeHtml(symbol())}`,
+      `Threshold: $${escapeHtml(formatUiString(comp.threshold_ui))}`,
       `Window: ${comp.duration_days} day(s)`,
       `Still eligible: ${eligible.length}`,
       "",
@@ -631,8 +643,8 @@ export function createEngine(ctx) {
       const held = Math.max(0, comp.ends_at - (row.entered_at || comp.started_at));
       lines.push(
         `${index + 1}. <code>${escapeHtml(row.wallet)}</code>`,
-        `Bought: ${escapeHtml(formatRaw(row.total_bought_raw, comp.decimals))} ${escapeHtml(symbol())}`,
-        `Still in comp: ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))} ${escapeHtml(symbol())}`,
+        `Bought: $${escapeHtml(formatUsd(Number(row.usd_cents || 0) / 100).slice(1))}`,
+        `Still held: $${escapeHtml(formatUsd(Number(remainingCredit(row.usd_cents || 0, row.total_bought_raw, row.balance_raw)) / 100).slice(1))}`,
         `Held above threshold: ${formatDuration(held)}`,
         "",
       );
@@ -665,12 +677,12 @@ export function createEngine(ctx) {
       `${escapeHtml(symbol())} hold contest`,
       "",
       `Prize: <b>${escapeHtml(comp.prize_text)}</b>`,
-      `Entry: <b>${escapeHtml(formatUiString(comp.threshold_ui))}</b> ${escapeHtml(symbol())}`,
+      `Entry: <b>$${escapeHtml(formatUiString(comp.threshold_ui))}</b>`,
       `Hold: <b>${escapeHtml(String(comp.duration_days))}</b> day(s)`,
       `Ends: ${escapeHtml(formatTimestamp(Math.floor(comp.ends_at / 1000)))}`,
       "",
-      "Buy at least the entry size and keep that balance until the end.",
-      "Drop under the line and you are out for good.",
+      "Buy at least that many dollars of tokens after the start, and hold them until the end.",
+      "Sell those tokens back under the dollar line and you are out for good.",
       "",
       "Type /buycomplb in this chat for every entry and the time left.",
     ].join("\n");
@@ -712,7 +724,7 @@ export function createEngine(ctx) {
       [
         "<b>Disqualified</b>",
         `<code>${escapeHtml(wallet)}</code>`,
-        "Sold or transferred below the entry size. Out for good.",
+        "Sold or transferred below the dollar entry. Out for good.",
       ].join("\n"),
     );
     await postToGroup(
@@ -720,21 +732,21 @@ export function createEngine(ctx) {
         "🚫 <b>DISQUALIFIED</b>",
         "",
         `<a href="${url}">${escapeHtml(shortAddress(wallet))}</a>`,
-        "Balance dropped under the entry size.",
+        "Sold under the dollar entry.",
       ].join("\n"),
     );
   }
 
-  async function announceEntry(wallet, comp, positionRaw) {
+  async function announceEntry(wallet, comp, creditedCents) {
     const left = Math.max(0, comp.ends_at - Date.now());
     const url = `https://solscan.io/account/${wallet}`;
-    const bought = positionRaw == null ? "n/a" : formatTokenUi(Number(positionRaw) / 10 ** comp.decimals);
+    const bought = formatUsd(Number(creditedCents || 0) / 100);
     await postToGroup(
       [
         "🔥 <b>NEW ENTRY</b>",
         "",
         `<a href="${url}">${escapeHtml(shortAddress(wallet))}</a>`,
-        `Bought since start: <b>${escapeHtml(bought)}</b> ${escapeHtml(symbol())}`,
+        `Bought since start: <b>${escapeHtml(bought)}</b>`,
         `Eligible in ${formatDuration(left)}`,
       ].join("\n"),
     );
@@ -759,45 +771,38 @@ export function createEngine(ctx) {
     if (!comp) return "No buy comp is running.";
     const rows = ctx.db.competitors(comp.id, "eligible");
     const closed = comp.status === "holding";
-    const leftMs = comp.ends_at - Date.now();
-    const left = formatDuration(Math.max(0, leftMs));
+    const left = formatDuration(Math.max(0, comp.ends_at - Date.now()));
     const lines = [
-      "<b>BUY COMP</b>",
-      escapeHtml(comp.prize_text),
-      `Entry ${escapeHtml(formatUiString(comp.threshold_ui))} ${escapeHtml(symbol())}`,
-      closed ? "Entries are closed. Hold is still being watched." : `Eligible in ${left}`,
+      `<b>BUY COMP</b> · ${closed ? "Entries closed" : `Eligible in ${left}`}`,
       "",
     ];
     if (!rows.length) {
-      lines.push("No entries yet. A wallet gets in when a buy leaves it at or above the entry size.");
+      lines.push("No entries yet.");
       return lines.join("\n");
     }
-    lines.push(`${rows.length} still in. The hold ends at the same time for every wallet.`, "");
     rows.forEach((row, index) => {
       const url = `https://solscan.io/account/${row.wallet}`;
-      lines.push(
-        `${index + 1}. <a href="${url}">${escapeHtml(shortAddress(row.wallet))}</a>`,
-        `In the comp ${escapeHtml(formatTokenUi(Number(row.balance_raw) / 10 ** comp.decimals))} ${escapeHtml(symbol())}`,
-        closed ? "Still holding" : `Eligible in ${left}`,
-        "",
-      );
+      const tokens = formatTokenUi(Number(row.total_bought_raw) / 10 ** comp.decimals);
+      const line = `${index + 1}. <a href="${url}">${escapeHtml(shortAddress(row.wallet))}</a> · ${escapeHtml(tokens)}`;
+      lines.push(line);
     });
     return lines.join("\n").slice(0, 4000);
   }
 
-  async function startCompetition({ thresholdUi, durationDays, prize, mediaType, mediaFileId }) {
+  async function startCompetition({ thresholdUsd, durationDays, prize, mediaType, mediaFileId }) {
     if (ctx.db.activeCompetition()) throw new Error("A competition is already running.");
     await ensureMeta();
     const dec = decimals();
     if (dec == null) {
       throw new Error("Token decimals are not loaded yet. Set the mint, check HELIUS_API_KEY, and try again in a few seconds.");
     }
-    const thresholdRaw = uiStringToRaw(thresholdUi, dec);
+    const cents = Math.round(Number(thresholdUsd) * 100);
+    if (!(cents > 0)) throw new Error("Entry amount must be greater than zero.");
     const startedAt = Date.now();
     const endsAt = startedAt + Math.round(durationDays * 86_400_000);
     const id = ctx.db.createCompetition({
-      thresholdUi,
-      thresholdRaw: thresholdRaw.toString(),
+      thresholdUi: String(thresholdUsd),
+      thresholdRaw: String(cents),
       decimals: dec,
       durationDays,
       prizeText: prize,
@@ -808,7 +813,7 @@ export function createEngine(ctx) {
     });
     const created = ctx.db.competition(id);
     await announceCompetition(created);
-    ctx.log.info("competition started", { id, thresholdUi, durationDays, card: Boolean(mediaFileId) });
+    ctx.log.info("competition started", { id, thresholdUsd, durationDays, card: Boolean(mediaFileId) });
     return ctx.db.competition(id);
   }
 
@@ -851,7 +856,7 @@ export function createEngine(ctx) {
       const held = row.entered_at ? formatDuration(Date.now() - row.entered_at) : "n/a";
       return [
         `<code>${escapeHtml(row.wallet)}</code>`,
-        `Bought ${escapeHtml(formatRaw(row.total_bought_raw, comp.decimals))} · Still in comp ${escapeHtml(formatRaw(row.balance_raw, comp.decimals))}`,
+        `Bought ${escapeHtml(formatUsd(Number(row.usd_cents || 0) / 100))} · Held ${escapeHtml(formatUsd(Number(remainingCredit(row.usd_cents || 0, row.total_bought_raw, row.balance_raw)) / 100))}`,
         kind === "eligible" ? `Held ${held}` : `Out ${row.disqualified_at ? formatTimestamp(Math.floor(row.disqualified_at / 1000)) : ""}`,
       ].join("\n");
     });
@@ -910,7 +915,7 @@ export function createEngine(ctx) {
     return lines.join("\n");
   }
 
-  async function startLottery({ ticketUsd, durationDays, prize, tiers }) {
+  async function startLottery({ ticketUsd, durationDays, prize, tiers, mediaType, mediaFileId }) {
     if (ctx.db.liveLottery()) throw new Error("A Trench Lottery is already running.");
     await ensureMeta();
     const dec = decimals();
@@ -927,9 +932,11 @@ export function createEngine(ctx) {
       decimals: dec,
       startedAt,
       endsAt,
+      mediaType: mediaType || "",
+      mediaFileId: mediaFileId || "",
     });
     const lot = ctx.db.lottery(id);
-    await postLotteryText(renderLotteryCard(lot));
+    await postToGroup(renderLotteryCard(lot), { type: lot.media_type, fileId: lot.media_file_id });
     ctx.log.info("lottery started", { id, ticketUsd: price, durationDays });
     return lot;
   }
