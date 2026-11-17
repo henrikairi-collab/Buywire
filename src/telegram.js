@@ -286,7 +286,7 @@ export function createTelegram(ctx) {
       lotteryTierPreview(draft.ticketUsd, draft.tiers || []),
       `Card: ${escapeHtml(card)}`,
       "",
-      "Only buys after the start count. Any sell burns that wallet's tickets.",
+      "Only buys after the start count. Any sell burns that wallet's tickets. A buy competition keeps running.",
     ].join("\n");
   }
 
@@ -314,7 +314,8 @@ export function createTelegram(ctx) {
       `Last transaction: ${escapeHtml(lastTx)}`,
       `Last alert: ${escapeHtml(lastAlert)}`,
       `Uptime: ${uptime}`,
-      comp ? `Competition #${comp.id} is active` : "No active competition",
+      comp ? `Buy comp #${comp.id} is running` : "No buy competition",
+      ctx.db.liveLottery() ? `Trench Lottery #${ctx.db.liveLottery().id} is running` : "No Trench Lottery",
     ].join("\n");
   }
 
@@ -576,7 +577,7 @@ export function createTelegram(ctx) {
         return show(
           update,
           posted
-            ? `Competition #${comp.id} is live. The card is in the alert group.`
+            ? `Competition #${comp.id} is live. The card is in the alert group. A Trench Lottery, if you start one, keeps running beside it.`
             : `Competition #${comp.id} is live, but no alert group is set. Add the bot to the group and send /setchat there. The card will post then.`,
           compKeyboard(),
         );
@@ -647,7 +648,12 @@ export function createTelegram(ctx) {
           mediaFileId: draft.mediaFileId || "",
         });
         ctx.db.clearSession(fromId);
-        return show(update, `Trench Lottery #${lot.id} is live. Only buys from now on count. Any sell burns that wallet.`, lotteryKeyboard());
+        const still = ctx.db.activeCompetition();
+        return show(
+          update,
+          `Trench Lottery #${lot.id} is live. Only buys from now on count. Any sell burns that wallet.${still ? ` Buy comp #${still.id} is still running beside it.` : ""}`,
+          lotteryKeyboard(),
+        );
       } catch (err) {
         return show(update, escapeHtml(err.message), lotteryKeyboard());
       }
@@ -681,7 +687,7 @@ export function createTelegram(ctx) {
       "<b>Buywire</b>",
       mint ? `Watching <code>${escapeHtml(shortAddress(mint))}</code>` : "No mint set yet. Open Settings.",
       "",
-      "Buy alerts, the hold competition, and Trench Lottery live here.",
+      "Buy alerts, the hold competition, and Trench Lottery can all run at the same time.",
     ].join("\n");
   }
 

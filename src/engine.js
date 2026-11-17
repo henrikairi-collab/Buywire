@@ -430,6 +430,24 @@ export function createEngine(ctx) {
     }
   }
 
+  async function recoverBuys(parsed) {
+    if (!parsed?.signature || parsed.buys?.length) return parsed;
+    try {
+      const raw = await chain.transaction(parsed.signature);
+      const fromRaw = raw && parseRawTransaction(raw, mint(), parsed.signature);
+      if (fromRaw?.buys?.length) {
+        ctx.log.info("buy recovered from raw transaction", {
+          signature: parsed.signature,
+          wallets: fromRaw.buys.map((buy) => buy.wallet),
+        });
+        return fromRaw;
+      }
+    } catch (err) {
+      ctx.log.warn("raw buy fallback failed", { signature: parsed.signature, err });
+    }
+    return parsed;
+  }
+
   async function ingestSignature(signature) {
     if (!signature || remembered(signature)) return;
     const current = mint();
@@ -443,8 +461,9 @@ export function createEngine(ctx) {
     }
     if (!parsed) {
       const raw = await chain.transaction(signature);
-      if (!raw) return;
-      parsed = parseRawTransaction(raw, current, signature);
+      if (raw) parsed = parseRawTransaction(raw, current, signature);
+    } else if (!parsed.buys?.length) {
+      parsed = await recoverBuys(parsed);
     }
     if (parsed) await handleParsed(parsed);
   }
@@ -452,7 +471,8 @@ export function createEngine(ctx) {
   async function ingestEnhanced(tx) {
     const current = mint();
     if (!current) return;
-    const parsed = parseEnhancedTransaction(tx, current);
+    let parsed = parseEnhancedTransaction(tx, current);
+    if (parsed) parsed = await recoverBuys(parsed);
     if (parsed) await handleParsed(parsed);
   }
 

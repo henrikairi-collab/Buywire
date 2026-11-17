@@ -213,27 +213,9 @@ export function parseEnhancedTransaction(tx, mint) {
 
   const looksLikeSwap =
     String(tx.type || "").toUpperCase() === "SWAP" || /swapped/i.test(tx.description || "");
-  if (!buys.length && looksLikeSwap && tx.feePayer) {
-    const delta = nets.get(tx.feePayer) || 0;
-    if (delta > 0) {
-      const decimals = Number(tx.events?.swap?.tokenOutputs?.[0]?.rawTokenAmount?.decimals ?? 0);
-      const amountRaw =
-        decimals > 0 ? uiApproxRaw(delta, decimals) : uiApproxRaw(delta, 0);
-      buys = [
-        {
-          wallet: tx.feePayer,
-          amountRaw,
-          decimals,
-          amountUi: delta,
-          solSpent: 0,
-          quoteSymbol: null,
-          quoteUi: 0,
-          dex,
-          signature: tx.signature,
-          timestamp,
-        },
-      ];
-    }
+  if (!buys.length) {
+    const direct = feePayerBuy(tx, mint, nets, dex, timestamp);
+    if (direct && (looksLikeSwap || paidOnEnhanced(tx, tx.feePayer, mint))) buys = [direct];
   }
 
   return {
@@ -244,6 +226,50 @@ export function parseEnhancedTransaction(tx, mint) {
       .filter(([, delta]) => delta !== 0)
       .map(([wallet, deltaUi]) => ({ wallet, deltaUi })),
     buys: dedupeBuys(buys),
+  };
+}
+
+export function dexFromLogs(logs) {
+  const text = String(logs || "");
+  if (/phantom/i.test(text)) return "Phantom";
+  if (/jupiter|jup6/i.test(text)) return "Jupiter";
+  if (/pump.?swap|pumpswap/i.test(text)) return "PumpSwap";
+  if (/pump/i.test(text)) return "Pump.fun";
+  if (/raydium/i.test(text)) return "Raydium";
+  if (/meteora/i.test(text)) return "Meteora";
+  if (/whirlpool|orca/i.test(text)) return "Orca";
+  return null;
+}
+
+function paidOnEnhanced(tx, wallet, mint) {
+  let sol = 0;
+  for (const row of tx.nativeTransfers || []) {
+    if (row.fromUserAccount === wallet) sol += Number(row.amount) / 1e9;
+  }
+  if (sol > 0.00002) return true;
+  return (tx.tokenTransfers || []).some(
+    (row) => row.fromUserAccount === wallet && row.mint !== mint && Number(row.tokenAmount) > 0,
+  );
+}
+
+function feePayerBuy(tx, mint, nets, dex, timestamp) {
+  const wallet = tx.feePayer;
+  const delta = wallet ? nets.get(wallet) || 0 : 0;
+  if (!wallet || delta <= 0) return null;
+  const looksLikeSwap = String(tx.type || "").toUpperCase() === "SWAP" || /swapped/i.test(tx.description || "");
+  if (!looksLikeSwap && !paidOnEnhanced(tx, wallet, mint)) return null;
+  const decimals = Number(tx.events?.swap?.tokenOutputs?.[0]?.rawTokenAmount?.decimals ?? 0);
+  return {
+    wallet,
+    amountRaw: decimals > 0 ? uiApproxRaw(delta, decimals) : uiApproxRaw(delta, 0),
+    decimals,
+    amountUi: delta,
+    solSpent: 0,
+    quoteSymbol: null,
+    quoteUi: 0,
+    dex,
+    signature: tx.signature,
+    timestamp,
   };
 }
 
@@ -315,8 +341,7 @@ function quotePaidBy(meta, owner, mint) {
     if (delta >= 0n) continue;
     const dec = decimals.get(tokenMint) || 0;
     const ui = rawToNumber(-delta, dec);
-    const symbol = QUOTE_SYMBOL[tokenMint] || (tokenMint === SOL_MINT ? "SOL" : null);
-    if (!symbol) continue;
+    const symbol = QUOTE_SYMBOL[tokenMint] || "TOKEN";
     if (!best || ui > best.ui) best = { symbol, ui };
   }
   return best;
@@ -349,13 +374,11 @@ export function parseRawTransaction(tx, mint, signature) {
   }
 
   const logs = (meta.logMessages || []).join("\n");
-  const dex = dexFromKeys(keys);
-  const swapish = Boolean(dex) || /instruction:\s*(swap|buy|route)/i.test(logs);
+  const dex = dexFromKeys(keys) || dexFromLogs(logs) || "DEX";
   const fee = BigInt(meta.fee || 0);
   const buys = [];
-  if (swapish) {
-    const signers = keys.filter((key) => key.signer).map((key) => key.pubkey);
-    for (const signer of signers) {
+  const signers = keys.filter((key) => key.signer).map((key) => key.pubkey);
+  for (const signer of signers) {
       const before = pre.map.get(signer) || 0n;
       const after = post.map.get(signer) || 0n;
       const delta = after - before;
@@ -376,11 +399,10 @@ export function parseRawTransaction(tx, mint, signature) {
         solSpent,
         quoteSymbol: quote?.symbol || (solSpent > 0 ? "SOL" : null),
         quoteUi: quote?.ui || solSpent,
-        dex: dex || "DEX",
+        dex,
         signature: sig,
         timestamp: Number(tx.blockTime) || Math.floor(Date.now() / 1000),
       });
-    }
   }
 
   return {
